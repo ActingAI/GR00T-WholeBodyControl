@@ -25,6 +25,7 @@ from datetime import datetime
 import json
 import time
 
+import msgpack
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import tyro
@@ -32,6 +33,8 @@ import zmq
 
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
+    get_genrobot_gripper_features,
+    get_genrobot_gripper_modality_config,
     get_features_sonic_vla,
     get_g1_robot_model,
     get_modality_config_sonic_vla,
@@ -99,6 +102,21 @@ class SonicDataExporterConfig:
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
+
+    wrist_camera_host: str = ""
+    """Optional secondary wrist camera server host. Empty means wrist images are in camera_host."""
+
+    wrist_camera_port: int = 5559
+    """Secondary wrist camera server port."""
+
+    record_genrobot_gripper: bool = False
+    """Record GENROBOT DAS actual/target opening distances."""
+
+    genrobot_gripper_state_host: str = ""
+    """GENROBOT gripper state ZMQ host. Empty defaults to camera_host."""
+
+    genrobot_gripper_state_port: int = 5569
+    """GENROBOT gripper state ZMQ port."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -199,6 +217,35 @@ class TimingThresholdMonitor:
         return False
 
 
+class GenRobotGripperStateSubscriber:
+    """ZMQ subscriber for actual GENROBOT gripper opening state from the G1."""
+
+    def __init__(self, host: str, port: int):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.SUB)
+        self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.socket.setsockopt(zmq.CONFLATE, True)
+        self.socket.setsockopt(zmq.RCVHWM, 3)
+        self.socket.connect(f"tcp://{host}:{port}")
+        self._latest_msg = None
+        print(f"[GENROBOT] Connected to gripper state at {host}:{port}")
+
+    def read(self) -> dict | None:
+        if not self.socket.poll(0):
+            return self._latest_msg
+        try:
+            self._latest_msg = msgpack.unpackb(self.socket.recv(zmq.NOBLOCK), raw=False)
+        except zmq.Again:
+            pass
+        except Exception as exc:
+            print(f"[GENROBOT] Failed to decode gripper state: {exc}")
+        return self._latest_msg
+
+    def close(self):
+        self.socket.close()
+        self.context.term()
+
+
 # ---------------------------------------------------------------------------
 # Data Collector
 # ---------------------------------------------------------------------------
@@ -212,7 +259,8 @@ class GrootDataCollector:
       - ``pose`` topic            -> SMPL pose (smpl_joints, body_quat_w, hand_joints, ...)
       - ``planner`` topic         -> planner commands (vr_position, vr_orientation, ...)
       - ``manager_state`` topic   -> current stream mode + toggle flags
-      - Camera client             -> ego-view images
+      - Camera client             -> ego-view and optional wrist images
+      - GENROBOT state            -> optional gripper encoder/target distances
     """
 
     def __init__(
@@ -227,23 +275,41 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        record_wrist_cameras: bool = False,
+        wrist_camera_host: str = "",
+        wrist_camera_port: int = 5559,
+        record_genrobot_gripper: bool = False,
+        genrobot_gripper_state_host: str = "",
+        genrobot_gripper_state_port: int = 5569,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self.record_wrist_cameras = record_wrist_cameras
+        self.record_genrobot_gripper = record_genrobot_gripper
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
 
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
+        self._wrist_image_subscriber = None
+        if record_wrist_cameras and wrist_camera_host:
+            self._wrist_image_subscriber = ComposedCameraClientSensor(
+                server_ip=wrist_camera_host,
+                port=wrist_camera_port,
+            )
+            print(f"[Camera] Secondary wrist camera stream: {wrist_camera_host}:{wrist_camera_port}")
 
         self.obs_act_buffer = deque(maxlen=100)
+        self.latest_primary_image_msg = None
+        self.latest_wrist_image_msg = None
         self.latest_image_msg = None
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        self.latest_genrobot_gripper_msg = None
 
         self.current_stream_mode = 0
 
@@ -273,6 +339,14 @@ class GrootDataCollector:
         except Exception as e:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
+
+        self._genrobot_gripper_subscriber = None
+        if record_genrobot_gripper:
+            state_host = genrobot_gripper_state_host or camera_host
+            self._genrobot_gripper_subscriber = GenRobotGripperStateSubscriber(
+                host=state_host,
+                port=genrobot_gripper_state_port,
+            )
 
         self.telemetry = Telemetry(window_size=100)
         self.sonic_timing_monitor = TimingThresholdMonitor(
@@ -304,6 +378,39 @@ class GrootDataCollector:
             msg["ros_timestamp"] = time.time()
 
         self.latest_proprio_msg = msg
+
+    def _compose_latest_image_msg(self):
+        """Merge the primary camera stream with an optional wrist-only stream."""
+        if self.latest_primary_image_msg is None:
+            return None
+
+        merged = {
+            "timestamps": dict(self.latest_primary_image_msg.get("timestamps", {})),
+            "images": dict(self.latest_primary_image_msg.get("images", {})),
+        }
+        if self.latest_wrist_image_msg is not None:
+            merged["timestamps"].update(self.latest_wrist_image_msg.get("timestamps", {}))
+            merged["images"].update(self.latest_wrist_image_msg.get("images", {}))
+        return merged
+
+    def _poll_genrobot_gripper_state(self):
+        if self._genrobot_gripper_subscriber is None:
+            return
+        msg = self._genrobot_gripper_subscriber.read()
+        if msg is not None:
+            self.latest_genrobot_gripper_msg = msg
+
+    def _missing_required_images(self) -> list[str]:
+        if self.latest_image_msg is None:
+            return []
+        images = self.latest_image_msg.get("images", {})
+        missing = []
+        for feature_name, feature_info in self.data_exporter.features.items():
+            if feature_info.get("dtype") in ["image", "video"]:
+                image_key = feature_name.split(".")[-1]
+                if image_key not in images:
+                    missing.append(image_key)
+        return missing
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -557,11 +664,27 @@ class GrootDataCollector:
     def _add_data_frame(self):
         t_start = time.monotonic()
 
-        if self.latest_proprio_msg is None or self.latest_image_msg is None:
+        missing_images = self._missing_required_images()
+        missing_genrobot = (
+            self.record_genrobot_gripper
+            and (
+                self.latest_genrobot_gripper_msg is None
+                or self.latest_genrobot_gripper_msg.get("left_encoder") is None
+                or self.latest_genrobot_gripper_msg.get("right_encoder") is None
+            )
+        )
+        if (
+            self.latest_proprio_msg is None
+            or self.latest_image_msg is None
+            or missing_images
+            or missing_genrobot
+        ):
             self._print_and_say(
                 f"Waiting for message. "
                 f"Avail msg: proprio {self.latest_proprio_msg is not None} | "
-                f"image {self.latest_image_msg is not None}",
+                f"image {self.latest_image_msg is not None} | "
+                f"missing images {missing_images} | "
+                f"genrobot {not missing_genrobot}",
                 say=False,
             )
             return False
@@ -605,6 +728,7 @@ class GrootDataCollector:
         }
 
         self._add_cpp_state_features(frame_data, proprio)
+        self._add_genrobot_gripper_features(frame_data)
 
         sonic_latency_ms = self._add_sonic_pose_features(frame_data)
 
@@ -663,6 +787,32 @@ class GrootDataCollector:
             frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
         else:
             frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+
+    def _add_genrobot_gripper_features(self, frame_data: dict) -> None:
+        if not self.record_genrobot_gripper:
+            return
+
+        msg = self.latest_genrobot_gripper_msg or {}
+        left_width = msg.get("left_encoder")
+        right_width = msg.get("right_encoder")
+        if left_width is None or right_width is None:
+            gripper_width = np.array([np.nan, np.nan], dtype=np.float32)
+        else:
+            gripper_width = np.array([left_width, right_width], dtype=np.float32)
+
+        left_target = msg.get("left_target")
+        right_target = msg.get("right_target")
+        if left_target is None:
+            left_target = left_width
+        if right_target is None:
+            right_target = right_width
+        if left_target is None or right_target is None:
+            gripper_target = np.array([np.nan, np.nan], dtype=np.float32)
+        else:
+            gripper_target = np.array([left_target, right_target], dtype=np.float32)
+
+        frame_data["observation.genrobot_gripper_width"] = gripper_width
+        frame_data["action.genrobot_gripper_target"] = gripper_target
 
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""
@@ -844,6 +994,20 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
+        if self._genrobot_gripper_subscriber is not None:
+            try:
+                self._genrobot_gripper_subscriber.close()
+            except Exception:
+                pass
+        try:
+            self._image_subscriber.stop_client()
+        except Exception:
+            pass
+        if self._wrist_image_subscriber is not None:
+            try:
+                self._wrist_image_subscriber.stop_client()
+            except Exception:
+                pass
         for sock in [self._sonic_zmq_socket]:
             if sock is not None:
                 try:
@@ -873,7 +1037,15 @@ class GrootDataCollector:
                     with self.telemetry.timer("poll_image"):
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
-                            self.latest_image_msg = img_msg
+                            self.latest_primary_image_msg = img_msg
+                        if self._wrist_image_subscriber is not None:
+                            wrist_img_msg = self._wrist_image_subscriber.read()
+                            if wrist_img_msg is not None:
+                                self.latest_wrist_image_msg = wrist_img_msg
+                        self.latest_image_msg = self._compose_latest_image_msg()
+
+                    with self.telemetry.timer("poll_genrobot"):
+                        self._poll_genrobot_gripper_state()
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -924,6 +1096,16 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
+    if config.record_genrobot_gripper:
+        print("[GENROBOT] Gripper opening enabled — adding to dataset schema")
+        dataset_features.update(get_genrobot_gripper_features())
+        genrobot_modality = get_genrobot_gripper_modality_config()
+        for key, value in genrobot_modality.items():
+            if key in modality_config:
+                modality_config[key].update(value)
+            else:
+                modality_config[key] = value
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
@@ -936,7 +1118,15 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "wrist_camera_host": config.wrist_camera_host,
+            "wrist_camera_port": config.wrist_camera_port,
+            "record_genrobot_gripper": config.record_genrobot_gripper,
+            "genrobot_gripper_state_host": config.genrobot_gripper_state_host,
+            "genrobot_gripper_state_port": config.genrobot_gripper_state_port,
+        },
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1140,12 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        record_wrist_cameras=config.record_wrist_cameras,
+        wrist_camera_host=config.wrist_camera_host,
+        wrist_camera_port=config.wrist_camera_port,
+        record_genrobot_gripper=config.record_genrobot_gripper,
+        genrobot_gripper_state_host=config.genrobot_gripper_state_host,
+        genrobot_gripper_state_port=config.genrobot_gripper_state_port,
     )
     data_collector.run()
 

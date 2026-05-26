@@ -24,7 +24,9 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import json
 import os
+import socket as socket_lib
 import subprocess
 import threading
 import time
@@ -514,6 +516,93 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 
 # Joystick deadzone threshold
 JOYSTICK_DEADZONE = 0.15
+
+
+class GenRobotGripperUdpClient:
+    """Sends Pico gripper trigger state to the ROS bridge running on the G1."""
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = 5568,
+        open_distance: float = 0.103,
+        close_distance: float = 0.0,
+        send_hz: float = 30.0,
+        change_epsilon: float = 0.001,
+        use_grip: bool = False,
+    ):
+        self.enabled = bool(host)
+        self.host = host
+        self.port = int(port)
+        self.open_distance = float(open_distance)
+        self.close_distance = float(close_distance)
+        self.min_interval = 1.0 / max(1.0, float(send_hz))
+        self.change_epsilon = float(change_epsilon)
+        self.use_grip = bool(use_grip)
+        self._socket = socket_lib.socket(socket_lib.AF_INET, socket_lib.SOCK_DGRAM) if self.enabled else None
+        self._last_send = 0.0
+        self._last_left = None
+        self._last_right = None
+
+        if self.enabled:
+            input_name = "trigger+grip" if self.use_grip else "trigger"
+            print(
+                "[GenRobotGripper] UDP enabled: "
+                f"{self.host}:{self.port}, input={input_name}, "
+                f"open={self.open_distance:.4f}, close={self.close_distance:.4f}"
+            )
+
+    @staticmethod
+    def _clamp_unit(value: float) -> float:
+        if value < 0.0:
+            return 0.0
+        if value > 1.0:
+            return 1.0
+        return float(value)
+
+    def _level(self, trigger: float, grip: float) -> float:
+        trigger = self._clamp_unit(float(trigger))
+        if not self.use_grip:
+            return trigger
+        return max(trigger, self._clamp_unit(float(grip)))
+
+    def _distance(self, level: float) -> float:
+        return self.open_distance + level * (self.close_distance - self.open_distance)
+
+    def update(self, left_trigger: float, left_grip: float, right_trigger: float, right_grip: float):
+        if not self.enabled:
+            return
+
+        left_distance = self._distance(self._level(left_trigger, left_grip))
+        right_distance = self._distance(self._level(right_trigger, right_grip))
+
+        now = time.time()
+        left_changed = self._last_left is None or abs(left_distance - self._last_left) >= self.change_epsilon
+        right_changed = self._last_right is None or abs(right_distance - self._last_right) >= self.change_epsilon
+        if not (left_changed or right_changed or now - self._last_send >= self.min_interval):
+            return
+
+        payload = {
+            "left": left_distance,
+            "right": right_distance,
+            "left_level": self._level(left_trigger, left_grip),
+            "right_level": self._level(right_trigger, right_grip),
+            "stamp": now,
+        }
+        try:
+            self._socket.sendto(json.dumps(payload, separators=(",", ":")).encode("utf-8"), (self.host, self.port))
+            self._last_left = left_distance
+            self._last_right = right_distance
+            self._last_send = now
+        except OSError as e:
+            if now - self._last_send >= 1.0:
+                print(f"[GenRobotGripper] UDP send failed: {e}")
+                self._last_send = now
+
+    def close(self):
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
 
 
 class YawAccumulator:
@@ -1814,6 +1903,11 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    genrobot_gripper_host: str = "",
+    genrobot_gripper_port: int = 5568,
+    genrobot_gripper_open_distance: float = 0.103,
+    genrobot_gripper_close_distance: float = 0.0,
+    genrobot_gripper_use_grip: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1877,6 +1971,13 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
     )
+    genrobot_gripper = GenRobotGripperUdpClient(
+        host=genrobot_gripper_host,
+        port=genrobot_gripper_port,
+        open_distance=genrobot_gripper_open_distance,
+        close_distance=genrobot_gripper_close_distance,
+        use_grip=genrobot_gripper_use_grip,
+    )
 
     # State machine diagram:
     #
@@ -1909,7 +2010,15 @@ def run_pico_manager(
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
+            left_menu_button, left_trigger_mgr, right_trigger_mgr, left_grip_mgr, right_grip_mgr = (
+                get_controller_inputs()
+            )
+            genrobot_gripper.update(
+                left_trigger_mgr,
+                left_grip_mgr,
+                right_trigger_mgr,
+                right_grip_mgr,
+            )
 
             left_axis_click, _ = get_axis_clicks()
 
@@ -2065,6 +2174,7 @@ def run_pico_manager(
         print("\nStopping manager...")
     finally:
         # Cleanup resources
+        genrobot_gripper.close()
         reader.stop()
         three_point.close()
         socket.close()
@@ -2156,6 +2266,40 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--genrobot-gripper-host",
+        "--genrobot_gripper_host",
+        type=str,
+        default="",
+        help="Enable GENROBOT DAS gripper UDP output to this G1 host/IP (disabled by default)",
+    )
+    parser.add_argument(
+        "--genrobot-gripper-port",
+        "--genrobot_gripper_port",
+        type=int,
+        default=5568,
+        help="GENROBOT DAS gripper UDP bridge port (default: 5568)",
+    )
+    parser.add_argument(
+        "--genrobot-gripper-open-distance",
+        "--genrobot_gripper_open_distance",
+        type=float,
+        default=0.103,
+        help="GENROBOT DAS gripper open distance in meters (default: 0.103)",
+    )
+    parser.add_argument(
+        "--genrobot-gripper-close-distance",
+        "--genrobot_gripper_close_distance",
+        type=float,
+        default=0.0,
+        help="GENROBOT DAS gripper closed distance in meters (default: 0.0)",
+    )
+    parser.add_argument(
+        "--genrobot-gripper-use-grip",
+        "--genrobot_gripper_use_grip",
+        action="store_true",
+        help="Use max(trigger, grip) for GENROBOT control instead of trigger-only",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2196,6 +2340,11 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            genrobot_gripper_host=args.genrobot_gripper_host,
+            genrobot_gripper_port=args.genrobot_gripper_port,
+            genrobot_gripper_open_distance=args.genrobot_gripper_open_distance,
+            genrobot_gripper_close_distance=args.genrobot_gripper_close_distance,
+            genrobot_gripper_use_grip=args.genrobot_gripper_use_grip,
         )
     else:
         # Run legacy single-thread pose streaming

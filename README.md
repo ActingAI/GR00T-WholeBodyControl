@@ -43,6 +43,7 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 ## Table of Contents
 
 - [News](#news)
+- [ActingAI Fork Additions](#actingai-fork-additions)
 - [GEAR-SONIC](#gear-sonic)
 - [VR Whole-Body Teleoperation](#vr-whole-body-teleoperation)
 - [Kinematic Planner](#kinematic-planner)
@@ -75,6 +76,117 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 SONIC is a humanoid behavior foundation model that gives robots a core set of motor skills learned from large-scale human motion data. Rather than building separate controllers for predefined motions, SONIC uses motion tracking as a scalable training task, enabling a single unified policy to produce natural, whole-body movement and support a wide range of behaviors — from walking and crawling to teleoperation and multi-modal control. It is designed to generalize beyond the motions it has seen during training and to serve as a foundation for higher-level planning and interaction.
 
 In this repo, we release SONIC's training code, deployment framework, model checkpoints, and teleoperation stack for data collection.
+
+## ActingAI Fork Additions
+
+This fork keeps the upstream SONIC workflow intact and adds local extensions for
+ActingAI's Unitree G1 data collection setup:
+
+- GENROBOT DAS gripper control from PICO controller triggers.
+- GENROBOT left/right wrist camera recording.
+- GENROBOT actual/target gripper opening recording.
+- A tmux data collection launcher option for local SONIC policy bundles.
+- Verification utilities for local ONNX deployment bundles.
+
+Large deployment assets are intentionally not tracked in git. Put local ONNX,
+TensorRT, and sidecar bundle files under:
+
+```text
+gear_sonic_deploy/policy/local/
+```
+
+That directory is ignored by git. The expected layout is documented in
+[`docs/source/references/local_policy_bundles.md`](docs/source/references/local_policy_bundles.md).
+
+### GENROBOT G1 Data Collection
+
+On the G1, the GENROBOT SDK publishes ROS topics for gripper control, encoder
+state, and the central wrist cameras. This fork adds two bridge scripts:
+
+```bash
+gear_sonic/scripts/genrobot_gripper_ros_bridge.py
+gear_sonic/scripts/genrobot_wrist_camera_zmq_bridge.py
+```
+
+The gripper bridge listens for workstation UDP commands on port `5568`, writes
+GENROBOT ROS targets, and publishes gripper state over ZMQ on `5569`. The wrist
+camera bridge republishes the left/right central ROS camera topics over ZMQ on
+`5559`.
+
+The standard collection command for the ActingAI G1 setup is:
+
+```bash
+cd ~/GR00T-WholeBodyControl
+python gear_sonic/scripts/launch_data_collection.py \
+  --camera-host 192.168.123.164 \
+  --camera-port 5555 \
+  --record-wrist-cameras \
+  --wrist-camera-host 192.168.123.164 \
+  --wrist-camera-port 5559 \
+  --record-genrobot-gripper \
+  --genrobot-gripper-state-host 192.168.123.164 \
+  --genrobot-gripper-state-port 5569 \
+  --pico-genrobot-gripper-host 192.168.123.164 \
+  --pico-genrobot-gripper-port 5568 \
+  --task-prompt "blanket_yellow_test"
+```
+
+This records:
+
+```text
+observation.images.ego_view
+observation.images.left_wrist
+observation.images.right_wrist
+observation.genrobot_gripper_width
+action.genrobot_gripper_target
+```
+
+By default, PICO triggers control the grippers: trigger released is open and
+trigger pressed is closed. The side-grip buttons remain reserved for data
+collection controls such as `left grip + A` and `left grip + B`. Add
+`--pico-genrobot-gripper-use-grip` only if you explicitly want side grip to also
+close the GENROBOT gripper.
+
+Detailed setup and troubleshooting notes are in
+[`docs/source/tutorials/genrobot_data_collection.md`](docs/source/tutorials/genrobot_data_collection.md).
+
+### Local Policy Bundle Presets
+
+The all-in-one launcher accepts local deploy presets:
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py --deploy-policy optimal ...
+```
+
+Available presets:
+
+| Preset | Meaning |
+| --- | --- |
+| `release` | upstream `policy/release` default |
+| `base` | public base `.pt` export converted to release schema |
+| `conservative` | finetuned conservative release-schema bundle |
+| `aggressive` | finetuned aggressive release-schema bundle |
+| `optimal` | recommended finetuned release-schema bundle |
+
+The non-release presets expect local files under
+`gear_sonic_deploy/policy/local/`. Verify a bundle before using it:
+
+```bash
+python tools/verify_sonic_deploy_bundle.py \
+  gear_sonic_deploy/policy/local/finetuned_release_schema/optimal_B_003500
+```
+
+For direct deploy without the launcher:
+
+```bash
+cd ~/GR00T-WholeBodyControl/gear_sonic_deploy
+source scripts/setup_env.sh
+./deploy.sh \
+  --cp policy/local/finetuned_release_schema/optimal_B_003500/model \
+  --obs-config policy/local/finetuned_release_schema/optimal_B_003500/observation_config.yaml \
+  --input-type zmq_manager \
+  real
+```
 
 
 ## VR Whole-Body Teleoperation

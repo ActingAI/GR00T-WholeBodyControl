@@ -216,6 +216,18 @@ logs_eval/
 # Model checkpoints directory
 models/
 
+# Local deploy policy bundles. These directories hold downloaded/exported
+# ONNX/TRT assets and small sidecar manifests for local robot deployment.
+# They are intentionally kept out of git; see docs/source/references/
+# local_policy_bundles.md for the expected layout.
+gear_sonic_deploy/policy/local/
+
+# Local transfer/archive artifacts
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/

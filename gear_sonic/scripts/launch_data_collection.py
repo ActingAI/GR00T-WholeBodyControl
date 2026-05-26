@@ -69,6 +69,27 @@ _bootstrap_venv()
 import tyro
 
 
+DEPLOY_POLICY_PRESETS = {
+    "release": ("", ""),
+    "base": (
+        "policy/local/base_public_pt_release_schema_041550/model",
+        "policy/local/base_public_pt_release_schema_041550/observation_config.yaml",
+    ),
+    "conservative": (
+        "policy/local/finetuned_release_schema/conservative_A_000500/model",
+        "policy/local/finetuned_release_schema/conservative_A_000500/observation_config.yaml",
+    ),
+    "aggressive": (
+        "policy/local/finetuned_release_schema/aggressive_B_002000/model",
+        "policy/local/finetuned_release_schema/aggressive_B_002000/observation_config.yaml",
+    ),
+    "optimal": (
+        "policy/local/finetuned_release_schema/optimal_B_003500/model",
+        "policy/local/finetuned_release_schema/optimal_B_003500/observation_config.yaml",
+    ),
+}
+
+
 def _get_local_ip() -> str:
     """Best-effort detection of the PC's LAN IP address."""
     try:
@@ -95,6 +116,10 @@ class DataCollectionLaunchConfig:
 
     deploy_zmq_host: str = "localhost"
     """ZMQ host for the C++ deploy to listen on."""
+
+    deploy_policy: str = ""
+    """Optional deploy policy preset: release, base, conservative, aggressive, optimal.
+    Leave empty to keep the original deploy.sh release default."""
 
     deploy_checkpoint: str = ""
     """Checkpoint path for deploy.sh (e.g., 'policy/checkpoints/my_model/model_step_100000').
@@ -125,6 +150,15 @@ class DataCollectionLaunchConfig:
     pico_waist_tracking: bool = False
     """Enable waist tracking on the teleop streamer."""
 
+    pico_genrobot_gripper_host: str = ""
+    """Enable GENROBOT gripper UDP control from PICO triggers to this G1 host/IP."""
+
+    pico_genrobot_gripper_port: int = 5568
+    """GENROBOT gripper UDP control bridge port on the G1."""
+
+    pico_genrobot_gripper_use_grip: bool = False
+    """Also let the controller side-grip value close the GENROBOT gripper."""
+
     # Data exporter options
     task_prompt: str = "demo"
     """Language task prompt for the data exporter."""
@@ -137,6 +171,21 @@ class DataCollectionLaunchConfig:
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
+
+    wrist_camera_host: str = ""
+    """Secondary wrist camera ZMQ host. Empty means wrist images are already in camera-host."""
+
+    wrist_camera_port: int = 5559
+    """Secondary wrist camera ZMQ port."""
+
+    record_genrobot_gripper: bool = False
+    """Record GENROBOT DAS actual/target gripper opening distances."""
+
+    genrobot_gripper_state_host: str = ""
+    """GENROBOT gripper state ZMQ host. Empty defaults to camera-host."""
+
+    genrobot_gripper_state_port: int = 5569
+    """GENROBOT gripper state ZMQ port."""
 
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
@@ -272,8 +321,33 @@ def _check_pane_alive(pane_index: int) -> bool:
     return result.stdout.strip() != "1"
 
 
+def _resolve_deploy_policy(config: DataCollectionLaunchConfig) -> tuple[str, str]:
+    """Return checkpoint and obs config after applying an optional policy preset."""
+    if not config.deploy_policy:
+        return config.deploy_checkpoint, config.deploy_obs_config
+
+    preset = config.deploy_policy.strip().lower()
+    if preset not in DEPLOY_POLICY_PRESETS:
+        valid = ", ".join(sorted(DEPLOY_POLICY_PRESETS))
+        print(f"ERROR: Unknown --deploy-policy '{config.deploy_policy}'.")
+        print(f"       Valid presets: {valid}")
+        sys.exit(1)
+
+    preset_checkpoint, preset_obs_config = DEPLOY_POLICY_PRESETS[preset]
+
+    if config.deploy_checkpoint and config.deploy_checkpoint != preset_checkpoint:
+        print("ERROR: Use either --deploy-policy or --deploy-checkpoint, not both.")
+        sys.exit(1)
+    if config.deploy_obs_config and config.deploy_obs_config != preset_obs_config:
+        print("ERROR: Use either --deploy-policy or --deploy-obs-config, not both.")
+        sys.exit(1)
+
+    return preset_checkpoint, preset_obs_config
+
+
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
+    deploy_checkpoint, deploy_obs_config = _resolve_deploy_policy(config)
 
     _check_prerequisites(sim=config.sim)
     _kill_existing_session()
@@ -285,12 +359,22 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Task prompt:     {config.task_prompt}")
     print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
     print(f"  Deploy input:    {config.deploy_input_type}")
-    if config.deploy_checkpoint:
-        print(f"  Checkpoint:      {config.deploy_checkpoint}")
+    print(f"  Deploy policy:   {config.deploy_policy or 'release default'}")
+    if deploy_checkpoint:
+        print(f"  Checkpoint:      {deploy_checkpoint}")
+        print(f"  Obs config:      {deploy_obs_config}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
+    if config.record_wrist_cameras and config.wrist_camera_host:
+        print(f"  Wrist camera ZMQ:{config.wrist_camera_host}:{config.wrist_camera_port}")
+    print(f"  GENROBOT record: {'Yes' if config.record_genrobot_gripper else 'No'}")
+    if config.pico_genrobot_gripper_host:
+        print(
+            f"  GENROBOT control:{config.pico_genrobot_gripper_host}:"
+            f"{config.pico_genrobot_gripper_port}"
+        )
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
     print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
@@ -331,10 +415,10 @@ def main(config: DataCollectionLaunchConfig):
         f"--input-type {config.deploy_input_type} "
         f"--zmq-host {config.deploy_zmq_host} "
     )
-    if config.deploy_checkpoint:
-        deploy_cmd += f"--cp {config.deploy_checkpoint} "
-    if config.deploy_obs_config:
-        deploy_cmd += f"--obs-config {config.deploy_obs_config} "
+    if deploy_checkpoint:
+        deploy_cmd += f"--cp {deploy_checkpoint} "
+    if deploy_obs_config:
+        deploy_cmd += f"--obs-config {deploy_obs_config} "
     if config.deploy_planner:
         deploy_cmd += f"--planner {config.deploy_planner} "
     if config.deploy_motion_data:
@@ -363,6 +447,13 @@ def main(config: DataCollectionLaunchConfig):
         pico_cmd += " --vis_smpl"
     if config.pico_waist_tracking:
         pico_cmd += " --waist_tracking"
+    if config.pico_genrobot_gripper_host:
+        pico_cmd += (
+            f" --genrobot-gripper-host {config.pico_genrobot_gripper_host}"
+            f" --genrobot-gripper-port {config.pico_genrobot_gripper_port}"
+        )
+        if config.pico_genrobot_gripper_use_grip:
+            pico_cmd += " --genrobot-gripper-use-grip"
 
     print("Starting PICO teleop streamer (pane 2)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
@@ -393,6 +484,18 @@ def main(config: DataCollectionLaunchConfig):
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
+        if config.wrist_camera_host:
+            exporter_cmd += (
+                f" --wrist-camera-host {config.wrist_camera_host}"
+                f" --wrist-camera-port {config.wrist_camera_port}"
+            )
+    if config.record_genrobot_gripper:
+        state_host = config.genrobot_gripper_state_host or config.camera_host
+        exporter_cmd += (
+            " --record-genrobot-gripper"
+            f" --genrobot-gripper-state-host {state_host}"
+            f" --genrobot-gripper-state-port {config.genrobot_gripper_state_port}"
+        )
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 

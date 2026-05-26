@@ -92,6 +92,7 @@ Documentation
    tutorials/manager
    tutorials/vr_wholebody_teleop
    tutorials/data_collection
+   tutorials/genrobot_data_collection
    tutorials/vla_workflow
    tutorials/vla_inference
 
@@ -130,6 +131,7 @@ Documentation
    references/observation_config
    references/motion_reference
    references/planner_onnx
+   references/local_policy_bundles
    references/jetpack6
    references/decoupled_wbc
    

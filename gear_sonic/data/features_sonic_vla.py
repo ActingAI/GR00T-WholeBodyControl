@@ -395,6 +395,42 @@ def get_wrist_camera_modality_config() -> dict:
     }
 
 
+def get_genrobot_gripper_features() -> dict:
+    """Features for the GENROBOT DAS gripper opening distance."""
+    return {
+        "observation.genrobot_gripper_width": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["left_gripper_width_m", "right_gripper_width_m"],
+        },
+        "action.genrobot_gripper_target": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["left_gripper_target_m", "right_gripper_target_m"],
+        },
+    }
+
+
+def get_genrobot_gripper_modality_config() -> dict:
+    """Modality config entries for GENROBOT actual and commanded opening."""
+    return {
+        "state": {
+            "genrobot_gripper_width": {
+                "start": 0,
+                "end": 2,
+                "original_key": "observation.genrobot_gripper_width",
+            },
+        },
+        "action": {
+            "genrobot_gripper_target": {
+                "start": 0,
+                "end": 2,
+                "original_key": "action.genrobot_gripper_target",
+            },
+        },
+    }
+
+
 def get_g1_robot_model(
     waist_location: Literal[
         "lower_body", "upper_body", "lower_and_upper_body"
