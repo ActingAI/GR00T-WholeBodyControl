@@ -36,6 +36,48 @@ from gear_sonic.data.video_writer import VideoWriter
 disable_progress_bars()
 
 
+def _load_json_if_exists(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def _is_empty_or_unstarted_dataset(root: Path) -> bool:
+    """Return True for directories that can be safely re-created.
+
+    LeRobot metadata creation writes ``meta/info.json`` immediately, but
+    ``tasks.jsonl`` and episode metadata are only written after the first saved
+    episode. If the recorder is interrupted before saving episode 0, restarting
+    should create a fresh dataset instead of trying to resume from HF.
+    """
+
+    if not root.exists():
+        return False
+
+    if not any(root.iterdir()):
+        return True
+
+    info = _load_json_if_exists(root / "meta" / "info.json")
+    if info is None:
+        return False
+
+    total_episodes = int(info.get("total_episodes", 0))
+    total_frames = int(info.get("total_frames", 0))
+    return total_episodes == 0 and total_frames == 0
+
+
+def _has_complete_resume_metadata(root: Path) -> bool:
+    required = [
+        root / "meta" / "info.json",
+        root / "meta" / "modality.json",
+        root / "meta" / "tasks.jsonl",
+        root / "meta" / "episodes.jsonl",
+        root / "meta" / "episodes_stats.jsonl",
+    ]
+    return all(path.exists() for path in required)
+
+
 # ---------------------------------------------------------------------------
 # ArgsConfig (inlined from decoupled_wbc.control.main.config_template)
 # ---------------------------------------------------------------------------
@@ -156,7 +198,7 @@ class Gr00tDataExporter(LeRobotDataset):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.video_writers = self.create_video_writer()
+        self.video_writers = {}
 
     @property
     def repo_id(self):
@@ -194,14 +236,40 @@ class Gr00tDataExporter(LeRobotDataset):
         obj = cls.__new__(cls)
         repo_id = "tmp/tmp_dataset"
 
-        if overwrite_existing and (Path(save_root)).exists():
+        save_root = Path(save_root)
+
+        if overwrite_existing and save_root.exists():
             print(
                 f"Found existing dataset at {save_root}",
                 "Cleaning up this directory since overwrite_existing is True.",
             )
             shutil.rmtree(save_root)
 
-        if (Path(save_root)).exists():
+        if save_root.exists() and _is_empty_or_unstarted_dataset(save_root):
+            print(
+                f"Found unstarted dataset directory at {save_root}.",
+                "Recreating it so recording can start cleanly.",
+            )
+            shutil.rmtree(save_root)
+
+        if save_root.exists():
+            if not _has_complete_resume_metadata(save_root):
+                missing = [
+                    str(path.relative_to(save_root))
+                    for path in [
+                        save_root / "meta" / "info.json",
+                        save_root / "meta" / "modality.json",
+                        save_root / "meta" / "tasks.jsonl",
+                        save_root / "meta" / "episodes.jsonl",
+                        save_root / "meta" / "episodes_stats.jsonl",
+                    ]
+                    if not path.exists()
+                ]
+                raise ValueError(
+                    f"Cannot resume dataset at {save_root}: missing metadata files "
+                    f"{missing}. If this dataset has no saved episodes, move or delete "
+                    "the directory and restart recording."
+                )
             try:
                 obj.meta = Gr00tDatasetMetadata(
                     repo_id=repo_id,
@@ -241,21 +309,28 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.delta_timestamps = None
         obj.delta_indices = None
         obj.episode_data_index = None
-        obj.video_writers = obj.create_video_writer()
+        obj.video_writers = {}
         return obj
 
     def create_video_writer(self) -> dict[str, VideoWriter]:
         video_writers = {}
         for key in self.meta.video_keys:
-            video_writers[key] = VideoWriter(
-                self.root
-                / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
-                self.meta.shapes[key][1],
-                self.meta.shapes[key][0],
-                self.fps,
-                self.vcodec,
-            )
+            video_writers[key] = self._create_video_writer(key)
         return video_writers
+
+    def _create_video_writer(self, key: str) -> VideoWriter:
+        return VideoWriter(
+            self.root / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
+            self.meta.shapes[key][1],
+            self.meta.shapes[key][0],
+            self.fps,
+            self.vcodec,
+        )
+
+    def _ensure_video_writer(self, key: str) -> VideoWriter:
+        if key not in self.video_writers:
+            self.video_writers[key] = self._create_video_writer(key)
+        return self.video_writers[key]
 
     def add_frame(self, frame: dict) -> None:
         """Add a frame to the episode buffer. Videos are handled by the video_writer."""
@@ -296,7 +371,7 @@ class Gr00tDataExporter(LeRobotDataset):
                 if frame_index == 0:
                     img_path.parent.mkdir(parents=True, exist_ok=True)
 
-                self.video_writers[key].add_frame(frame[key])
+                self._ensure_video_writer(key).add_frame(frame[key])
                 self.episode_buffer[key].append(str(img_path))
             else:
                 self.episode_buffer[key].append(frame[key])
@@ -312,10 +387,15 @@ class Gr00tDataExporter(LeRobotDataset):
             self.video_writers[key].stop()
 
     def skip_and_start_new_episode(self) -> None:
-        """Skip the current episode and start a new one."""
-        self.stop_video_writers()
+        """Skip the current episode without writing it to the dataset."""
+        if not hasattr(self, "video_writers"):
+            raise RuntimeError(
+                "Can't skip episode because video writers haven't been initialized."
+            )
+        for writer in self.video_writers.values():
+            writer.cancel()
         self.episode_buffer = self.create_episode_buffer()
-        self.video_writers = self.create_video_writer()
+        self.video_writers = {}
 
     def save_episode(self, episode_data: dict | None = None) -> None:
         if not episode_data:
@@ -383,7 +463,7 @@ class Gr00tDataExporter(LeRobotDataset):
 
         if not episode_data:
             self.episode_buffer = self.create_episode_buffer()
-            self.video_writers = self.create_video_writer()
+            self.video_writers = {}
 
         for key in self.meta.video_keys:
             video_path = os.path.join(self.root, self.meta.get_video_file_path(episode_index, key))

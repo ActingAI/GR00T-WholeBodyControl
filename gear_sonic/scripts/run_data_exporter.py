@@ -235,6 +235,7 @@ class GenRobotGripperStateSubscriber:
             return self._latest_msg
         try:
             self._latest_msg = msgpack.unpackb(self.socket.recv(zmq.NOBLOCK), raw=False)
+            self._latest_msg["exporter_receive_timestamp"] = time.time()
         except zmq.Again:
             pass
         except Exception as exc:
@@ -244,6 +245,10 @@ class GenRobotGripperStateSubscriber:
     def close(self):
         self.socket.close()
         self.context.term()
+
+
+GENROBOT_GRIPPER_MIN_M = 0.0
+GENROBOT_GRIPPER_MAX_M = 0.103
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +317,9 @@ class GrootDataCollector:
         self.latest_genrobot_gripper_msg = None
 
         self.current_stream_mode = 0
+        self._last_recorded_robot_index: int | None = None
+        self._last_recorded_motion_token: np.ndarray | None = None
+        self._last_recorded_image_timestamps: dict[str, float] = {}
 
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
@@ -377,6 +385,8 @@ class GrootDataCollector:
         if msg.get("ros_timestamp", 0.0) == 0.0:
             msg["ros_timestamp"] = time.time()
 
+        msg["receive_timestamp"] = time.time()
+        msg["receive_monotonic"] = time.monotonic()
         self.latest_proprio_msg = msg
 
     def _compose_latest_image_msg(self):
@@ -387,10 +397,18 @@ class GrootDataCollector:
         merged = {
             "timestamps": dict(self.latest_primary_image_msg.get("timestamps", {})),
             "images": dict(self.latest_primary_image_msg.get("images", {})),
+            "receive_timestamps": {},
         }
+        primary_receive_ts = float(self.latest_primary_image_msg.get("receive_timestamp", 0.0))
+        for image_key in merged["images"].keys():
+            merged["receive_timestamps"][image_key] = primary_receive_ts
+
         if self.latest_wrist_image_msg is not None:
             merged["timestamps"].update(self.latest_wrist_image_msg.get("timestamps", {}))
             merged["images"].update(self.latest_wrist_image_msg.get("images", {}))
+            wrist_receive_ts = float(self.latest_wrist_image_msg.get("receive_timestamp", 0.0))
+            for image_key in self.latest_wrist_image_msg.get("images", {}).keys():
+                merged["receive_timestamps"][image_key] = wrist_receive_ts
         return merged
 
     def _poll_genrobot_gripper_state(self):
@@ -436,10 +454,10 @@ class GrootDataCollector:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
-                self.data_exporter.save_episode_as_discarded()
+                self.data_exporter.skip_and_start_new_episode()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
-                self._print_and_say("Discarded episode", blocking=False)
+                self._print_and_say("Skipped episode without saving", blocking=False)
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -590,6 +608,8 @@ class GrootDataCollector:
                 "vr_3pt_position": vr_3pt_position,
                 "vr_3pt_orientation": vr_3pt_orientation,
                 "frame_index": frame_index,
+                "timestamp_realtime": self._extract_scalar(pose_data, "timestamp_realtime", 0.0),
+                "timestamp_monotonic": self._extract_scalar(pose_data, "timestamp_monotonic", 0.0),
                 "receive_timestamp": time.time(),
             }
         except Exception as e:
@@ -617,6 +637,17 @@ class GrootDataCollector:
             return bool(val.flat[0])
         return bool(val)
 
+    @staticmethod
+    def _extract_scalar(pose_data: dict, key: str, default: float = 0.0) -> float:
+        val = pose_data.get(key)
+        if val is None:
+            return default
+        if isinstance(val, np.ndarray):
+            if val.size == 0:
+                return default
+            return float(val.flat[0])
+        return float(val)
+
     def _log_latency_periodic(
         self,
         sonic_latency_ms: float | None = None,
@@ -641,8 +672,134 @@ class GrootDataCollector:
                     raise ValueError(
                         f"Required image '{image_key}' for feature '{feature_name}' "
                         f"not found in image message. Available: {list(images.keys())}"
-                    )
+                )
                 frame_data[feature_name] = images[image_key]
+
+    @staticmethod
+    def _array_from_msg(msg: dict, key: str, size: int, dtype=np.float64) -> np.ndarray:
+        value = msg.get(key)
+        if value is None:
+            return np.zeros(size, dtype=dtype)
+        arr = np.asarray(value, dtype=dtype).reshape(-1)
+        if arr.size == size:
+            return arr
+        out = np.zeros(size, dtype=dtype)
+        n = min(size, arr.size)
+        out[:n] = arr[:n]
+        return out
+
+    @staticmethod
+    def _float_from_msg(msg: dict | None, key: str, default: float = 0.0) -> float:
+        if msg is None:
+            return default
+        value = msg.get(key)
+        if value is None:
+            return default
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return default
+            return float(value.flat[0])
+        return float(value)
+
+    def _add_sync_and_status_features(self, frame_data: dict, proprio: dict) -> None:
+        now_realtime = time.time()
+        now_monotonic = time.monotonic()
+        image_timestamps = (self.latest_image_msg or {}).get("timestamps", {})
+        image_receive_timestamps = (self.latest_image_msg or {}).get("receive_timestamps", {})
+        smpl_msg = self.latest_sonic_msg or {}
+        planner_msg = self.latest_planner_msg or {}
+        gripper_msg = self.latest_genrobot_gripper_msg or {}
+
+        robot_index = int(proprio.get("index", -1))
+        if self._last_recorded_robot_index is None or robot_index < 0:
+            delta_index = 0
+        else:
+            delta_index = robot_index - self._last_recorded_robot_index
+        robot_state_skipped = int(delta_index > 1)
+
+        token = np.asarray(frame_data["action.motion_token"], dtype=np.float64)
+        if self._last_recorded_motion_token is None:
+            motion_token_changed = 1
+        else:
+            motion_token_changed = int(
+                not np.array_equal(token, self._last_recorded_motion_token)
+            )
+
+        image_keys = ["ego_view", "ego_view_depth", "left_wrist", "right_wrist"]
+        image_changed = []
+        for image_key in image_keys:
+            current_ts = float(image_timestamps.get(image_key, 0.0))
+            previous_ts = self._last_recorded_image_timestamps.get(image_key)
+            image_changed.append(int(previous_ts is None or current_ts != previous_ts))
+
+        robot_receive_ts = float(proprio.get("receive_timestamp", 0.0))
+        primary_receive_ts = float(image_receive_timestamps.get("ego_view", 0.0))
+        wrist_receive_ts = float(image_receive_timestamps.get("left_wrist", 0.0))
+        sonic_pose_receive_ts = float(smpl_msg.get("receive_timestamp", 0.0))
+        genrobot_receive_ts = float(gripper_msg.get("exporter_receive_timestamp", 0.0))
+
+        def receive_age(receive_ts: float) -> float:
+            return now_realtime - receive_ts if receive_ts > 0.0 else -1.0
+
+        frame_data["observation.robot_state_index"] = np.array(
+            [robot_index, delta_index], dtype=np.int64
+        )
+        frame_data["observation.sync_timestamps"] = np.array(
+            [
+                now_realtime,
+                now_monotonic,
+                float(proprio.get("ros_timestamp", 0.0)),
+                robot_receive_ts,
+                float(proprio.get("ros_timestamp", 0.0)),
+                float(image_timestamps.get("ego_view", 0.0)),
+                float(image_timestamps.get("ego_view_depth", 0.0)),
+                float(image_timestamps.get("left_wrist", 0.0)),
+                float(image_timestamps.get("right_wrist", 0.0)),
+                primary_receive_ts,
+                wrist_receive_ts,
+                float(smpl_msg.get("timestamp_realtime", 0.0)),
+                float(smpl_msg.get("timestamp_monotonic", 0.0)),
+                sonic_pose_receive_ts,
+                float(planner_msg.get("receive_timestamp", 0.0)),
+                float(gripper_msg.get("timestamp", 0.0)),
+                float(gripper_msg.get("receive_timestamp", 0.0)),
+            ],
+            dtype=np.float64,
+        )
+        frame_data["observation.sync_frame_changed"] = np.array(
+            [
+                int(delta_index != 0 or self._last_recorded_robot_index is None),
+                motion_token_changed,
+                *image_changed,
+            ],
+            dtype=np.int32,
+        )
+        frame_data["observation.sync_receive_age_s"] = np.array(
+            [
+                receive_age(robot_receive_ts),
+                receive_age(primary_receive_ts),
+                receive_age(wrist_receive_ts),
+                receive_age(sonic_pose_receive_ts),
+                receive_age(genrobot_receive_ts),
+            ],
+            dtype=np.float64,
+        )
+        frame_data["observation.sonic_status"] = np.array(
+            [
+                int(self.current_stream_mode),
+                int(proprio.get("encoder_mode", -2)),
+                int(bool(proprio.get("motion_playing", False))),
+                robot_state_skipped,
+            ],
+            dtype=np.int32,
+        )
+
+        self._last_recorded_robot_index = robot_index
+        self._last_recorded_motion_token = token.copy()
+        for image_key in image_keys:
+            self._last_recorded_image_timestamps[image_key] = float(
+                image_timestamps.get(image_key, 0.0)
+            )
 
     def _finalize_frame(self, t_start: float) -> bool:
         t_end = time.monotonic()
@@ -733,6 +890,7 @@ class GrootDataCollector:
         sonic_latency_ms = self._add_sonic_pose_features(frame_data)
 
         self._add_images_to_frame_data(frame_data)
+        self._add_sync_and_status_features(frame_data, proprio)
 
         self._log_latency_periodic(sonic_latency_ms)
 
@@ -740,6 +898,25 @@ class GrootDataCollector:
         return self._finalize_frame(t_start)
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
+        frame_data["observation.body_qpos"] = self._array_from_msg(
+            proprio, "body_q", 29, dtype=np.float64
+        )
+        frame_data["observation.body_qvel"] = self._array_from_msg(
+            proprio, "body_dq", 29, dtype=np.float64
+        )
+        frame_data["observation.base_angular_velocity"] = self._array_from_msg(
+            proprio, "base_ang_vel", 3, dtype=np.float64
+        )
+        frame_data["observation.base_linear_acceleration"] = self._array_from_msg(
+            proprio, "base_accel", 3, dtype=np.float64
+        )
+        frame_data["observation.torso_orientation"] = self._array_from_msg(
+            proprio, "body_torso_quat", 4, dtype=np.float64
+        )
+        frame_data["observation.torso_angular_velocity"] = self._array_from_msg(
+            proprio, "body_torso_ang_vel", 3, dtype=np.float64
+        )
+
         if "base_quat" in proprio:
             base_quat = np.asarray(proprio["base_quat"], dtype=np.float64)
             frame_data["observation.root_orientation"] = base_quat
@@ -784,9 +961,16 @@ class GrootDataCollector:
             frame_data["teleop.delta_heading"] = np.zeros(1, dtype=np.float64)
 
         if "token_state" in proprio:
-            frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
+            motion_token = np.asarray(proprio["token_state"], dtype=np.float64)
         else:
-            frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+            motion_token = np.zeros(64, dtype=np.float64)
+        if motion_token.size != 64:
+            token_out = np.zeros(64, dtype=np.float64)
+            n = min(64, motion_token.size)
+            token_out[:n] = motion_token.reshape(-1)[:n]
+            motion_token = token_out
+        frame_data["action.motion_token"] = motion_token
+        frame_data["observation.sonic_motion_token"] = motion_token.copy()
 
     def _add_genrobot_gripper_features(self, frame_data: dict) -> None:
         if not self.record_genrobot_gripper:
@@ -799,6 +983,9 @@ class GrootDataCollector:
             gripper_width = np.array([np.nan, np.nan], dtype=np.float32)
         else:
             gripper_width = np.array([left_width, right_width], dtype=np.float32)
+        gripper_width = np.clip(
+            gripper_width, GENROBOT_GRIPPER_MIN_M, GENROBOT_GRIPPER_MAX_M
+        ).astype(np.float32)
 
         left_target = msg.get("left_target")
         right_target = msg.get("right_target")
@@ -810,9 +997,22 @@ class GrootDataCollector:
             gripper_target = np.array([np.nan, np.nan], dtype=np.float32)
         else:
             gripper_target = np.array([left_target, right_target], dtype=np.float32)
+        gripper_target = np.clip(
+            gripper_target, GENROBOT_GRIPPER_MIN_M, GENROBOT_GRIPPER_MAX_M
+        ).astype(np.float32)
 
         frame_data["observation.genrobot_gripper_width"] = gripper_width
         frame_data["action.genrobot_gripper_target"] = gripper_target
+        frame_data["observation.genrobot_gripper_timestamps"] = np.array(
+            [
+                float(msg.get("timestamp", 0.0)),
+                float(msg.get("left_encoder_ros_time", 0.0)),
+                float(msg.get("right_encoder_ros_time", 0.0)),
+                float(msg.get("receive_timestamp", 0.0)),
+                float(msg.get("exporter_receive_timestamp", 0.0)),
+            ],
+            dtype=np.float64,
+        )
 
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""

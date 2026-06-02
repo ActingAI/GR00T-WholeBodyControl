@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 30 keys (28 always-present + 2 conditional).
+ * A single msgpack map with up to 32 keys (30 always-present + 2 conditional).
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -55,10 +55,12 @@
  *      |                        |              |
  *      | **Encoder**            |              |
  *  17  | token_state            | double[N]    | Encoder token state (empty array if N/A).
+ *  18  | encoder_mode           | int          | Encoder mode used for the current token.
+ *  19  | motion_playing         | bool         | Operator playback/control state.
  *      |                        |              |
  *      | **Heading** *(conditional — only when heading state is available)* |
- *  18  | init_base_quat         | double[4]    | Initial base quaternion at heading init.
- *  19  | delta_heading          | double       | Accumulated heading delta (rad).
+ *  20  | init_base_quat         | double[4]    | Initial base quaternion at heading init.
+ *  21  | delta_heading          | double       | Accumulated heading delta (rad).
  *      |                        |              |
  *      | **Viz: targets** *(from current motion frame + heading correction)* |
  *  20  | base_trans_target      | double[3]    | Target base translation.
@@ -279,9 +281,9 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 18 base + 2 optional heading
+        // State-logger fields: 20 base + 2 optional heading
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 20 : 18;
+        int num_state_fields = has_heading_state ? 22 : 20;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
@@ -379,6 +381,12 @@ private:
         } else {
             pk.pack_array(0);
         }
+
+        pk.pack("encoder_mode");
+        pk.pack(state.encoder_mode);
+
+        pk.pack("motion_playing");
+        pk.pack(state.play);
 
         // Motor temperature: hardware order, 2 values per motor (winding, driver)
         pk.pack("motor_temperature");

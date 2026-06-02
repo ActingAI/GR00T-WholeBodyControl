@@ -225,8 +225,10 @@ gear_sonic_deploy/policy/local/
 # Local transfer/archive artifacts
 *.zip
 *.tar
+*.tar.zst
 *.tar.gz
 *.tgz
+vanilla_dp_*/
 
 # Downloaded from HuggingFace (hf download)
 sample_data/

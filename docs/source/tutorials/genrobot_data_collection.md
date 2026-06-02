@@ -185,7 +185,30 @@ When `--record-genrobot-gripper` is enabled, the dataset also contains:
 ```text
 observation.genrobot_gripper_width  # shape [2], left/right actual opening in meters
 action.genrobot_gripper_target      # shape [2], left/right commanded opening in meters
+observation.genrobot_gripper_timestamps  # shape [5], state/encoder/exporter timing
 ```
+
+All SONIC VLA recordings also include synchronization and tracker diagnostics
+intended for token-level downstream policies:
+
+```text
+observation.body_qpos              # shape [29], G1 body qpos in MuJoCo order
+observation.body_qvel              # shape [29], G1 body qvel in MuJoCo order
+observation.base_angular_velocity  # shape [3]
+observation.base_linear_acceleration  # shape [3]
+observation.torso_orientation      # shape [4], torso IMU quaternion
+observation.torso_angular_velocity # shape [3]
+observation.sonic_motion_token     # shape [64], current SONIC token state
+observation.sonic_status           # shape [4], stream_mode, encoder_mode, motion_playing, robot_state_skipped
+observation.robot_state_index      # shape [2], C++ state index and delta since previous recorded frame
+observation.sync_timestamps        # shape [17], exporter/source/receive timestamps
+observation.sync_frame_changed     # shape [6], source-frame changed flags for robot/token/cameras
+observation.sync_receive_age_s     # shape [5], receive-age diagnostics on the workstation clock
+```
+
+Camera videos are encoded at the dataset FPS.  The physical cameras usually
+produce fresh frames at about 30 Hz, so `sync_frame_changed` should be used to
+distinguish newly captured images from sample-and-held frames in 50 Hz rows.
 
 The gripper features are registered in:
 

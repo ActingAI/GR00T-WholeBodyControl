@@ -97,6 +97,67 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "original_key": "observation.init_base_quat",
                 "rotation_type": "quaternion",
             },
+            "body_qpos": {
+                "start": 0,
+                "end": 29,
+                "original_key": "observation.body_qpos",
+            },
+            "body_qvel": {
+                "start": 0,
+                "end": 29,
+                "original_key": "observation.body_qvel",
+            },
+            "base_angular_velocity": {
+                "start": 0,
+                "end": 3,
+                "original_key": "observation.base_angular_velocity",
+            },
+            "base_linear_acceleration": {
+                "start": 0,
+                "end": 3,
+                "original_key": "observation.base_linear_acceleration",
+            },
+            "torso_orientation": {
+                "start": 0,
+                "end": 4,
+                "original_key": "observation.torso_orientation",
+                "rotation_type": "quaternion",
+            },
+            "torso_angular_velocity": {
+                "start": 0,
+                "end": 3,
+                "original_key": "observation.torso_angular_velocity",
+            },
+            "sonic_motion_token": {
+                "start": 0,
+                "end": 64,
+                "original_key": "observation.sonic_motion_token",
+            },
+            "sonic_status": {
+                "start": 0,
+                "end": 4,
+                "original_key": "observation.sonic_status",
+            },
+            "robot_state_index": {
+                "start": 0,
+                "end": 2,
+                "original_key": "observation.robot_state_index",
+            },
+            "sync_timestamps": {
+                "start": 0,
+                "end": 17,
+                "original_key": "observation.sync_timestamps",
+            },
+            "sync_frame_changed": {
+                "start": 0,
+                "end": 6,
+                "original_key": "observation.sync_frame_changed",
+            },
+            "sync_receive_age_s": {
+                "start": 0,
+                "end": 5,
+                "original_key": "observation.sync_receive_age_s",
+            },
         },
         "action": {
             "delta_heading": {
@@ -256,6 +317,102 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (4,),
             "names": ["init_base_qw", "init_base_qx", "init_base_qy", "init_base_qz"],
         },
+        "observation.body_qpos": {
+            "dtype": "float64",
+            "shape": (29,),
+            "names": "body_qpos",
+        },
+        "observation.body_qvel": {
+            "dtype": "float64",
+            "shape": (29,),
+            "names": "body_qvel",
+        },
+        "observation.base_angular_velocity": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["base_wx", "base_wy", "base_wz"],
+        },
+        "observation.base_linear_acceleration": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["base_ax", "base_ay", "base_az"],
+        },
+        "observation.torso_orientation": {
+            "dtype": "float64",
+            "shape": (4,),
+            "names": ["torso_qw", "torso_qx", "torso_qy", "torso_qz"],
+        },
+        "observation.torso_angular_velocity": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["torso_wx", "torso_wy", "torso_wz"],
+        },
+        "observation.sonic_motion_token": {
+            "dtype": "float64",
+            "shape": (64,),
+            "names": "sonic_motion_token",
+        },
+        "observation.sonic_status": {
+            "dtype": "int32",
+            "shape": (4,),
+            "names": [
+                "stream_mode",
+                "encoder_mode",
+                "motion_playing",
+                "robot_state_skipped",
+            ],
+        },
+        "observation.robot_state_index": {
+            "dtype": "int64",
+            "shape": (2,),
+            "names": ["state_index", "delta_index"],
+        },
+        "observation.sync_timestamps": {
+            "dtype": "float64",
+            "shape": (17,),
+            "names": [
+                "exporter_realtime_s",
+                "exporter_monotonic_s",
+                "robot_ros_s",
+                "robot_receive_s",
+                "motion_token_s",
+                "ego_view_camera_s",
+                "ego_view_depth_camera_s",
+                "left_wrist_camera_s",
+                "right_wrist_camera_s",
+                "primary_camera_receive_s",
+                "wrist_camera_receive_s",
+                "sonic_pose_realtime_s",
+                "sonic_pose_monotonic_s",
+                "sonic_pose_receive_s",
+                "sonic_planner_receive_s",
+                "genrobot_state_publish_s",
+                "genrobot_encoder_receive_s",
+            ],
+        },
+        "observation.sync_frame_changed": {
+            "dtype": "int32",
+            "shape": (6,),
+            "names": [
+                "robot_state_changed",
+                "motion_token_changed",
+                "ego_view_changed",
+                "ego_view_depth_changed",
+                "left_wrist_changed",
+                "right_wrist_changed",
+            ],
+        },
+        "observation.sync_receive_age_s": {
+            "dtype": "float64",
+            "shape": (5,),
+            "names": [
+                "robot_receive_age_s",
+                "primary_camera_receive_age_s",
+                "wrist_camera_receive_age_s",
+                "sonic_pose_receive_age_s",
+                "genrobot_receive_age_s",
+            ],
+        },
         "teleop.delta_heading": {
             "dtype": "float64",
             "shape": (1,),
@@ -408,6 +565,17 @@ def get_genrobot_gripper_features() -> dict:
             "shape": (2,),
             "names": ["left_gripper_target_m", "right_gripper_target_m"],
         },
+        "observation.genrobot_gripper_timestamps": {
+            "dtype": "float64",
+            "shape": (5,),
+            "names": [
+                "state_publish_time_s",
+                "left_encoder_ros_time_s",
+                "right_encoder_ros_time_s",
+                "encoder_callback_time_s",
+                "exporter_receive_time_s",
+            ],
+        },
     }
 
 
@@ -419,6 +587,11 @@ def get_genrobot_gripper_modality_config() -> dict:
                 "start": 0,
                 "end": 2,
                 "original_key": "observation.genrobot_gripper_width",
+            },
+            "genrobot_gripper_timestamps": {
+                "start": 0,
+                "end": 5,
+                "original_key": "observation.genrobot_gripper_timestamps",
             },
         },
         "action": {

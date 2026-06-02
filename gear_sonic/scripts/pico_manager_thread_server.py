@@ -1921,6 +1921,15 @@ def run_pico_manager(
         )
     subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
+    genrobot_gripper = GenRobotGripperUdpClient(
+        host=genrobot_gripper_host,
+        port=genrobot_gripper_port,
+        open_distance=genrobot_gripper_open_distance,
+        close_distance=genrobot_gripper_close_distance,
+        use_grip=genrobot_gripper_use_grip,
+    )
+    genrobot_gripper.update(0.0, 0.0, 0.0, 0.0)
+
     print("Waiting for body tracking data...")
     while not xrt.is_body_data_available():
         print("waiting for body data...")
@@ -1971,14 +1980,6 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
     )
-    genrobot_gripper = GenRobotGripperUdpClient(
-        host=genrobot_gripper_host,
-        port=genrobot_gripper_port,
-        open_distance=genrobot_gripper_open_distance,
-        close_distance=genrobot_gripper_close_distance,
-        use_grip=genrobot_gripper_use_grip,
-    )
-
     # State machine diagram:
     #
     #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
