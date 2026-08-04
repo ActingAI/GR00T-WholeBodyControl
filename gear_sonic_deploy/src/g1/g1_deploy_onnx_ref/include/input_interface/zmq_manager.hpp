@@ -444,6 +444,13 @@ class ZMQManager : public InputInterface {
       return InputInterface::GetLastUpdateTime();
     }
 
+    StreamDiagnostics GetStreamDiagnostics() const override {
+      if (active_mode_ == ManagedMode::STREAMED_MOTION && pose_interface_) {
+        return pose_interface_->GetStreamDiagnostics();
+      }
+      return {};
+    }
+
   private:
     // Handle planner mode input (similar to GamepadManager::handleGamepadPlannerInput)
     void handlePlannerInput(MotionDataReader& motion_reader,

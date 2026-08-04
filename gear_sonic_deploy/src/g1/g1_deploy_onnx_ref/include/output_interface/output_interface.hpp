@@ -44,6 +44,7 @@
 
 #include "../state_logger.hpp"
 #include "../motion_data_reader.hpp"
+#include "../input_interface/input_interface.hpp"
 
 /**
  * @class OutputInterface
@@ -90,7 +91,8 @@ public:
         const std::array<double, 4>& init_ref_data_root_rot_array,
         DataBuffer<HeadingState>& heading_state_buffer,
         std::shared_ptr<const MotionSequence> current_motion,
-        int current_frame
+        int current_frame,
+        const InputInterface::StreamDiagnostics& stream_diagnostics
     ) = 0;
 
     /// @return The OutputType tag for this concrete implementation.
@@ -148,6 +150,7 @@ protected:
         static const std::string kBaseTransTarget = "base_trans_target";
         static const std::string kBaseQuatTarget = "base_quat_target";
         static const std::string kBodyQTarget = "body_q_target";
+        static const std::string kBodyDqTarget = "body_dq_target";
         static const std::string kBaseTransMeasured = "base_trans_measured";
         static const std::string kBaseQuatMeasured = "base_quat_measured";
         static const std::string kBodyQMeasured = "body_q_measured";
@@ -174,6 +177,8 @@ protected:
         // ---- Initialise target arrays with safe defaults ----
         std::array<double, 29> body_q_target;
         body_q_target.fill(0.0);
+        std::array<double, 29> body_dq_target;
+        body_dq_target.fill(0.0);
         std::array<double, 3> base_trans_target = {0.0, 0.0, 0.0};
         std::array<double, 4> base_quat_target = {1.0, 0.0, 0.0, 0.0};  // Identity quaternion
         
@@ -190,6 +195,7 @@ protected:
         if (has_joint_data) {
           for (int i = 0; i < 29; i++) {
             body_q_target[i] = current_motion->JointPositions(current_frame)[isaaclab_to_mujoco[i]];
+            body_dq_target[i] = current_motion->JointVelocities(current_frame)[isaaclab_to_mujoco[i]];
           }
         }
 
@@ -258,6 +264,7 @@ protected:
         output_data_map_[kBaseTransTarget].assign(base_trans_target.begin(), base_trans_target.end());
         output_data_map_[kBaseQuatTarget].assign(base_quat_target.begin(), base_quat_target.end());
         output_data_map_[kBodyQTarget].assign(body_q_target.begin(), body_q_target.end());
+        output_data_map_[kBodyDqTarget].assign(body_dq_target.begin(), body_dq_target.end());
 
         output_data_map_[kBaseTransMeasured].assign(base_trans_measured.begin(), base_trans_measured.end());
         output_data_map_[kBaseQuatMeasured].assign(base_quat_measured.begin(), base_quat_measured.end());
@@ -293,4 +300,3 @@ protected:
 };
 
 #endif // OUTPUT_INTERFACE_HPP
-

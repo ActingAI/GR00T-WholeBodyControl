@@ -171,7 +171,8 @@ public:
         const std::array<double, 4>& init_ref_data_root_rot_array,
         DataBuffer<HeadingState>& heading_state_buffer,
         std::shared_ptr<const MotionSequence> current_motion,
-        int current_frame
+        int current_frame,
+        const InputInterface::StreamDiagnostics& stream_diagnostics
     ) override
     {
         // 1. Compute visualisation data (populates output_data_map_)
@@ -188,7 +189,7 @@ public:
         );
 
         // 2. Build a single combined message with state-logger + visualisation fields
-        pack_combined_state(heading_state_buffer);
+        pack_combined_state(heading_state_buffer, current_motion, current_frame, stream_diagnostics);
 
         // 3. Send once on user topic (e.g. "g1_debug")
         if (state_data_sbuf_.size() > 0) {
@@ -262,7 +263,11 @@ private:
      *
      * This avoids sending two overlapping messages per tick.
      */
-    void pack_combined_state(const DataBuffer<HeadingState>& heading_state_buffer) {
+    void pack_combined_state(
+        const DataBuffer<HeadingState>& heading_state_buffer,
+        const std::shared_ptr<const MotionSequence>& current_motion,
+        int current_frame,
+        const InputInterface::StreamDiagnostics& stream_diagnostics) {
         state_data_sbuf_.clear();
 
         if (state_logger_.size() == 0) {
@@ -285,7 +290,29 @@ private:
         // Visualisation fields: output_data_map_.size() (typically 11)
         int num_state_fields = has_heading_state ? 22 : 20;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
-        pk.pack_map(num_state_fields + num_viz_fields);
+        constexpr int num_stream_fields = 8;
+        pk.pack_map(num_state_fields + num_viz_fields + num_stream_fields);
+
+        const int motion_end = current_motion && current_motion->timesteps > 0
+            ? static_cast<int>(current_motion->timesteps) - 1 : -1;
+        const int remaining = motion_end >= current_frame ? motion_end - current_frame : -1;
+        int clamp_count = 0;
+        if (motion_end >= 0) {
+            for (int offset = 0; offset <= 45; offset += 5) {
+                if (current_frame + offset > motion_end) ++clamp_count;
+            }
+        }
+        const int global_frame = stream_diagnostics.active
+            ? stream_diagnostics.window_start + current_frame * stream_diagnostics.frame_step
+            : current_frame;
+        pk.pack("stream_global_frame"); pk.pack(global_frame);
+        pk.pack("stream_window_start"); pk.pack(stream_diagnostics.window_start);
+        pk.pack("stream_buffer_end"); pk.pack(stream_diagnostics.active ? stream_diagnostics.window_end : motion_end);
+        pk.pack("stream_local_frame"); pk.pack(current_frame);
+        pk.pack("stream_remaining_future_frames"); pk.pack(remaining);
+        pk.pack("stream_encoder_clamp_count"); pk.pack(clamp_count);
+        pk.pack("stream_frame_step"); pk.pack(stream_diagnostics.frame_step);
+        pk.pack("stream_active"); pk.pack(stream_diagnostics.active);
 
         // ---- State-logger fields ----
 

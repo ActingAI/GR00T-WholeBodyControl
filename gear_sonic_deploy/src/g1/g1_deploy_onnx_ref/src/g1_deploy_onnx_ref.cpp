@@ -3968,7 +3968,8 @@ class G1Deploy {
               output_interface->publish(
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
                 left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,
-                heading_state_buffer_, current_motion_copy, current_frame_copy
+                heading_state_buffer_, current_motion_copy, current_frame_copy,
+                input_interface_->GetStreamDiagnostics()
               );
             }
           }
@@ -4465,4 +4466,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-

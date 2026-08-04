@@ -169,7 +169,8 @@ public:
         const std::array<double, 4>& init_ref_data_root_rot_array,
         DataBuffer<HeadingState>& heading_state_buffer,
         std::shared_ptr<const MotionSequence> current_motion,
-        int current_frame
+        int current_frame,
+        const InputInterface::StreamDiagnostics& stream_diagnostics
     ) override {
         if (!node_ || !rclcpp::ok()) {
             return;
@@ -558,4 +559,3 @@ private:
 #endif // HAS_ROS2
 
 #endif // ROS2_OUTPUT_HANDLER_HPP
-

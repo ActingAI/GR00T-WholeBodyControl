@@ -50,6 +50,12 @@
  */
 class InputInterface {
 public:
+    struct StreamDiagnostics {
+      bool active = false;
+      int window_start = 0;
+      int window_end = -1;
+      int frame_step = 1;
+    };
 
     /// Identifies the physical / logical source of this input interface.
     enum class InputType {
@@ -113,6 +119,10 @@ public:
     /// @return The InputType tag for this concrete implementation.
     virtual InputType GetType() {
       return type_;
+    }
+
+    virtual StreamDiagnostics GetStreamDiagnostics() const {
+      return {};
     }
 
     /// @return True if this interface provides upper-body joint targets (17 DOF).
