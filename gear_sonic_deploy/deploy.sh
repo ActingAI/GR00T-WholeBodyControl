@@ -215,6 +215,8 @@ show_usage() {
     echo "  --tracking-max-ticks N  Optional embedded pilot limit (0 = full clip)"
     echo "  --tracking-max-first-target-error-rad RAD  First-command guard (default: 0.5)"
     echo "  --embedded-tracking-dry-run  Validate package/TensorRT and exit without DDS"
+    echo "  --enable-csv-logs       Enable C++ state/embedded tracking CSV logs"
+    echo "  --logs-dir PATH         Set the C++ log output directory"
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
@@ -266,6 +268,8 @@ INIT_STATE=""
 TRACKING_MAX_TICKS="0"
 TRACKING_MAX_FIRST_TARGET_ERROR_RAD="0.5"
 EMBEDDED_TRACKING_DRY_RUN=false
+ENABLE_CSV_LOGS=false
+LOGS_DIR=""
 INPUT_TYPE_WAS_SET=false
 
 # Parse arguments
@@ -335,6 +339,18 @@ while [[ $# -gt 0 ]]; do
             EMBEDDED_TRACKING_DRY_RUN=true
             shift
             ;;
+        --enable-csv-logs)
+            ENABLE_CSV_LOGS=true
+            shift
+            ;;
+        --logs-dir)
+            if [[ -z "${2:-}" ]]; then
+                echo -e "${RED}Error: --logs-dir requires a path argument${NC}" >&2
+                exit 1
+            fi
+            LOGS_DIR="$2"
+            shift 2
+            ;;
         --input-type)
             if [[ -z "$2" ]]; then
                 echo -e "${RED}Error: --input-type requires a type argument${NC}" >&2
@@ -363,6 +379,10 @@ while [[ $# -gt 0 ]]; do
         sim|real)
             INTERFACE_MODE="$1"
             shift
+            ;;
+        --*)
+            echo -e "${RED}Error: unknown option '$1'${NC}" >&2
+            exit 1
             ;;
         *)
             # Could be interface name or IP
@@ -590,6 +610,10 @@ fi
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  CSV Logs:           ${GREEN}$ENABLE_CSV_LOGS${NC}"
+if [[ -n "$LOGS_DIR" ]]; then
+echo -e "  Logs Dir:           ${GREEN}$LOGS_DIR${NC}"
+fi
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi
@@ -617,6 +641,12 @@ fi
 echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
+if [[ "$ENABLE_CSV_LOGS" == true ]]; then
+echo -e "${BLUE}    --enable-csv-logs \\${NC}"
+fi
+if [[ -n "$LOGS_DIR" ]]; then
+echo -e "${BLUE}    --logs-dir $LOGS_DIR${NC}"
+fi
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "${BLUE}    $EXTRA_ARGS${NC}"
 fi
@@ -637,6 +667,14 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
     echo -e "${GREEN}🚀 Starting deployment...${NC}"
     echo ""
+
+    LOG_ARGS=()
+    if [[ "$ENABLE_CSV_LOGS" == true ]]; then
+        LOG_ARGS+=(--enable-csv-logs)
+    fi
+    if [[ -n "$LOGS_DIR" ]]; then
+        LOG_ARGS+=(--logs-dir "$LOGS_DIR")
+    fi
     
     if [[ "$POLICY_TYPE" == "embedded_tracking_onnx" ]]; then
         EMBEDDED_DRY_RUN_ARG=()
@@ -657,6 +695,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --output-type "$OUTPUT_TYPE" \
             --zmq-host "$ZMQ_HOST" \
             "${EMBEDDED_DRY_RUN_ARG[@]}" \
+            "${LOG_ARGS[@]}" \
             "${EXTRA_ARGS_ARRAY[@]}"
     else
         # Keep the legacy SONIC command line unchanged by default.
@@ -668,6 +707,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
                 --input-type "$INPUT_TYPE" \
                 --output-type "$OUTPUT_TYPE" \
                 --zmq-host "$ZMQ_HOST" \
+                "${LOG_ARGS[@]}" \
                 $EXTRA_ARGS
         else
             just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
@@ -676,7 +716,8 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
                 --planner-file "$PLANNER" \
                 --input-type "$INPUT_TYPE" \
                 --output-type "$OUTPUT_TYPE" \
-                --zmq-host "$ZMQ_HOST"
+                --zmq-host "$ZMQ_HOST" \
+                "${LOG_ARGS[@]}"
         fi
     fi
 else
