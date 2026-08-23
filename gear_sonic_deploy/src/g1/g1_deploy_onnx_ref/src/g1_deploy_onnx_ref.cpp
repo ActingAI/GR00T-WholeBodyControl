@@ -101,6 +101,7 @@
 // Robot parameters
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
+#include "../include/external_reference_tracking.hpp"
 
 // Input interface and input handlers
 #include "../include/input_interface/keyboard_handler.hpp"
@@ -357,6 +358,23 @@ class G1Deploy {
     
     // Control policy
     std::unique_ptr<PolicyEngine> policy_engine_;
+
+    // Opt-in external-reference backend. The default SONIC backend never
+    // reads these fields and retains its original observation/action path.
+    bool external_ref_enabled_ = false;
+    external_ref_tracking::ControlConfig external_control_;
+    external_ref_tracking::InitialState external_initial_state_;
+    std::unique_ptr<external_ref_tracking::ReferenceProvider> external_reference_;
+    std::unique_ptr<external_ref_tracking::ObservationBuilder> external_obs_builder_;
+    std::size_t external_frame_ = 0;
+    std::size_t external_ticks_ = 0;
+    std::size_t external_max_ticks_ = 250;
+    float external_gain_scale_ = 0.25f;
+    float external_max_first_error_ = 0.5f;
+    float external_max_target_step_ = 0.5f;
+    bool external_first_command_ = true;
+    external_ref_tracking::JointArray external_previous_target_{};
+    std::unique_ptr<std::ofstream> external_log_file_;
     
     // =========================================================================
     // Observation system configuration and runtime state
@@ -2156,7 +2174,17 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      bool external_ref_enabled = false,
+      std::string external_reference_path = "",
+      std::string external_control_path = "",
+      std::string external_init_path = "",
+      std::size_t external_reference_frames = 941,
+      std::size_t external_max_ticks = 250,
+      float external_gain_scale = 0.25f,
+      float external_max_first_error = 0.5f,
+      float external_max_target_step = 0.5f,
+      std::string external_log_path = "")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2177,6 +2205,57 @@ class G1Deploy {
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
+
+      external_ref_enabled_ = external_ref_enabled;
+      if (external_ref_enabled_) {
+        if (!obs_config_path.empty() || !encoder_file_path.empty() || !planner_file_path.empty()) {
+          throw std::runtime_error(
+              "external_ref_tracking forbids SONIC obs config, encoder, and planner");
+        }
+        if (external_reference_path.empty() || external_control_path.empty() ||
+            external_init_path.empty() || external_max_ticks == 0 ||
+            external_gain_scale <= 0.0f || external_gain_scale > 1.0f ||
+            external_max_first_error <= 0.0f || external_max_target_step <= 0.0f) {
+          throw std::runtime_error("invalid external-reference safety/config arguments");
+        }
+        external_control_ = external_ref_tracking::ControlConfig::Load(external_control_path);
+        external_initial_state_ = external_ref_tracking::InitialState::Load(external_init_path);
+        external_reference_ = std::make_unique<external_ref_tracking::ReferenceProvider>(
+            external_reference_path, external_reference_frames);
+        const auto policy_names = external_ref_tracking::ReadOnnxJointNames(model_path);
+        if (policy_names != external_control_.joint_names ||
+            policy_names != external_reference_->JointNames()) {
+          throw std::runtime_error("external policy/reference/control joint order mismatch");
+        }
+        external_obs_builder_ = std::make_unique<external_ref_tracking::ObservationBuilder>(
+            external_control_);
+        external_max_ticks_ = external_max_ticks;
+        external_gain_scale_ = external_gain_scale;
+        external_max_first_error_ = external_max_first_error;
+        external_max_target_step_ = external_max_target_step;
+        initial_encoder_mode_ = -2;
+        if (!external_log_path.empty()) {
+          external_log_file_ = std::make_unique<std::ofstream>(external_log_path, std::ios::trunc);
+          if (!external_log_file_->good()) {
+            throw std::runtime_error("cannot open external control log: " + external_log_path);
+          }
+          (*external_log_file_) << "tick,frame,action_min,action_max,q_target_min,q_target_max,max_measured_error,max_target_step";
+          for (const auto name : external_ref_tracking::kHardwareJointNames) {
+            (*external_log_file_) << ",raw_" << name;
+          }
+          for (const auto name : external_ref_tracking::kHardwareJointNames) {
+            (*external_log_file_) << ",q_target_" << name;
+          }
+          for (const auto name : external_ref_tracking::kHardwareJointNames) {
+            (*external_log_file_) << ",q_measured_" << name;
+          }
+          (*external_log_file_) << '\n';
+        }
+        std::cout << "[ExternalRef] preflight PASS: 29 direct hardware-order joints, "
+                  << external_reference_->Size() << " frames, gain_scale="
+                  << external_gain_scale_ << ", max_ticks=" << external_max_ticks_ << std::endl;
+        std::cout << "[ExternalRef] SONIC output reorder applied: false" << std::endl;
+      }
       
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
@@ -2259,8 +2338,8 @@ class G1Deploy {
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
       imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
-      // Load motion data
-      if (motion_reader_.ReadFromCSV(motion_data_path)) {
+      // Load SONIC motion data only for the unchanged SONIC backend.
+      if (!external_ref_enabled_ && motion_reader_.ReadFromCSV(motion_data_path)) {
         if (!motion_reader_.motions.empty()) {
           std::cout << "✓ Motion data loaded successfully!" << std::endl;
           // motion_reader_.PrintSummary();
@@ -2282,7 +2361,7 @@ class G1Deploy {
           std::cout << "Exiting..." << std::endl;
           throw std::runtime_error("No valid motions found in motion data directory");
         }
-      } else {
+      } else if (!external_ref_enabled_) {
         std::cout << "✗ Error: Could not access motion data from " << motion_data_path << std::endl;
         std::cout << "Make sure the path exists and contains motion folders." << std::endl;
         std::cout << "Control system cannot function without motion data!" << std::endl;
@@ -2300,6 +2379,9 @@ class G1Deploy {
       // Initialize observation buffer with correct size (zero-initialized)
       size_t obs_dim = policy_engine_->GetInputDimension();
       obs_buffer_.resize(obs_dim, 0.0);
+      if (external_ref_enabled_ && obs_dim != external_ref_tracking::kObservationDim) {
+        throw std::runtime_error("external tracking policy input dimension must be 1570");
+      }
       
       // Capture CUDA graph for optimized execution
       if (!policy_engine_->CaptureGraph()) {
@@ -2308,6 +2390,7 @@ class G1Deploy {
       
       std::cout << "✓ Policy model loaded successfully!" << std::endl;
 
+      if (!external_ref_enabled_) {
       // Load observation configuration FIRST (before encoder/planner initialization)
       std::cout << "Loading observation configuration..." << std::endl;
       FullObservationConfig full_obs_config;
@@ -2418,6 +2501,11 @@ class G1Deploy {
       
       // Log observation configuration details
       LogObservationConfiguration();
+      } else {
+        is_using_encoder_ = false;
+        planner_path.clear();
+        std::cout << "[ExternalRef] SONIC observation registry/encoder/planner bypassed" << std::endl;
+      }
 
       // Prepare robot configuration for data collection (after all initialization is complete)
       std::map<std::string, std::variant<std::string, int, double, bool>> robot_config;
@@ -2431,6 +2519,7 @@ class G1Deploy {
       robot_config["is_using_encoder"] = is_using_encoder_;
       robot_config["policy_fp16"] = policy_fp16;
       robot_config["planner_fp16"] = planner_fp16;
+      robot_config["policy_backend"] = external_ref_enabled_ ? "external_ref_tracking" : "sonic";
 
       // Initialize state logger with complete robot configuration
       try {
@@ -2732,18 +2821,25 @@ class G1Deploy {
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
         motor_command_tmp.tau_ff.at(i) = 0.0;
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i]);
+        const float init_target = external_ref_enabled_
+            ? external_reference_->Frame(0).joint_pos[i]
+            : static_cast<float>(default_angles[i]);
+        motor_command_tmp.q_target.at(i) = init_target;
         motor_command_tmp.dq_target.at(i) = 0.0;
-        motor_command_tmp.kp.at(i) = kps[i];
-        motor_command_tmp.kd.at(i) = kds[i];
+        motor_command_tmp.kp.at(i) = external_ref_enabled_
+            ? external_control_.joint_stiffness[i] * external_gain_scale_ : kps[i];
+        motor_command_tmp.kd.at(i) = external_ref_enabled_
+            ? external_control_.joint_damping[i] * external_gain_scale_ : kds[i];
       }
       time_ += control_dt_;
       if (time_ < duration_) {
         for (int i = 0; i < G1_NUM_MOTOR; i++) {
           double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
           double current_pos = ls->motor_state()[i].q();
+          const double init_target = external_ref_enabled_
+              ? external_reference_->Frame(0).joint_pos[i] : default_angles[i];
           motor_command_tmp.q_target.at(i) =
-              static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+              static_cast<float>(current_pos * (1.0 - ratio) + init_target * ratio);
         }
         dex3_hands_.close(true);
         dex3_hands_.close(false);
@@ -3127,6 +3223,125 @@ class G1Deploy {
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
+    }
+
+    external_ref_tracking::RobotState GatherExternalRobotState() const {
+      const auto ls = low_state_buffer_.GetDataWithTime().data;
+      if (!ls) { throw std::runtime_error("external tracking has no LowState"); }
+      external_ref_tracking::RobotState state;
+      const auto quat = ls->imu_state().quaternion();
+      const auto gyro = ls->imu_state().gyroscope();
+      for (int i = 0; i < 4; ++i) state.base_quat_wxyz[i] = quat[i];
+      for (int i = 0; i < 3; ++i) state.base_ang_vel[i] = gyro[i];
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        state.joint_pos[i] = ls->motor_state()[i].q();
+        state.joint_vel[i] = ls->motor_state()[i].dq();
+        if (!std::isfinite(state.joint_pos[i]) ||
+            !std::isfinite(state.joint_vel[i]) ||
+            std::abs(state.joint_vel[i]) > 35.0f) {
+          throw std::runtime_error("invalid external tracking joint state at " +
+                                   std::to_string(i));
+        }
+      }
+      return state;
+    }
+
+    void ResetExternalTracking() {
+      const auto state = GatherExternalRobotState();
+      external_obs_builder_->Reset(state);
+      external_frame_ = 0;
+      external_ticks_ = 0;
+      external_first_command_ = true;
+      external_previous_target_ = state.joint_pos;
+      std::fill(last_action.begin(), last_action.end(), 0.0);
+      std::cout << "[ExternalRef] control armed at frame 0; direct hardware order; "
+                << "max_ticks=" << external_max_ticks_ << std::endl;
+    }
+
+    bool RunExternalTrackingTick() {
+      try {
+        const auto state = GatherExternalRobotState();
+        external_obs_builder_->PushRobotState(state);
+        const auto observation = external_obs_builder_->Build(
+            *external_reference_, external_frame_, state.base_quat_wxyz);
+        auto& policy_input = policy_engine_->GetInputBuffer();
+        std::copy(observation.begin(), observation.end(), policy_input.begin());
+        if (!policy_engine_->Infer()) return false;
+
+        const auto& output = policy_engine_->GetActionBuffer();
+        external_ref_tracking::JointArray raw_action{};
+        external_ref_tracking::JointArray target{};
+        float max_measured_error = 0.0f;
+        float max_target_step = 0.0f;
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          raw_action[i] = output[i];  // Explicitly direct: no SONIC reorder.
+          if (!std::isfinite(raw_action[i])) {
+            throw std::runtime_error("non-finite external policy action");
+          }
+          target[i] = external_control_.JointTarget(i, raw_action[i]);
+          max_measured_error = std::max(max_measured_error,
+                                        std::abs(target[i] - state.joint_pos[i]));
+          max_target_step = std::max(max_target_step,
+                                     std::abs(target[i] - external_previous_target_[i]));
+        }
+        if (external_first_command_ && max_measured_error > external_max_first_error_) {
+          throw std::runtime_error("first q_target jump exceeds protection limit: " +
+                                   std::to_string(max_measured_error));
+        }
+        if (!external_first_command_ && max_target_step > external_max_target_step_) {
+          throw std::runtime_error("q_target step exceeds protection limit: " +
+                                   std::to_string(max_target_step));
+        }
+
+        MotorCommand command;
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          command.q_target.at(i) = target[i];
+          command.dq_target.at(i) = 0.0f;
+          command.tau_ff.at(i) = 0.0f;
+          command.kp.at(i) = external_control_.joint_stiffness[i] * external_gain_scale_;
+          command.kd.at(i) = external_control_.joint_damping[i] * external_gain_scale_;
+          last_action[i] = raw_action[i];
+        }
+        motor_command_buffer_.SetData(command);
+        external_obs_builder_->PushRawAction(raw_action);
+        external_previous_target_ = target;
+        external_first_command_ = false;
+
+        if (external_log_file_ && external_log_file_->good()) {
+          const auto action_range = std::minmax_element(raw_action.begin(), raw_action.end());
+          const auto target_range = std::minmax_element(target.begin(), target.end());
+          (*external_log_file_) << external_ticks_ << ',' << external_frame_ << ','
+              << *action_range.first << ',' << *action_range.second << ','
+              << *target_range.first << ',' << *target_range.second << ','
+              << max_measured_error << ',' << max_target_step;
+          for (float value : raw_action) (*external_log_file_) << ',' << value;
+          for (float value : target) (*external_log_file_) << ',' << value;
+          for (float value : state.joint_pos) (*external_log_file_) << ',' << value;
+          (*external_log_file_) << '\n';
+          external_log_file_->flush();
+        }
+        if (external_ticks_ < 5 || external_ticks_ % 50 == 0) {
+          const auto obs_range = std::minmax_element(observation.begin(), observation.end());
+          const auto action_range = std::minmax_element(raw_action.begin(), raw_action.end());
+          const auto target_range = std::minmax_element(target.begin(), target.end());
+          std::cout << "[ExternalRef] tick=" << external_ticks_
+                    << " frame=" << external_frame_ << " obs_shape=[1,1570] obs=["
+                    << *obs_range.first << ',' << *obs_range.second << "] action=["
+                    << *action_range.first << ',' << *action_range.second << "] q_target=["
+                    << *target_range.first << ',' << *target_range.second << "]" << std::endl;
+        }
+        ++external_ticks_;
+        external_frame_ = std::min(external_frame_ + 1, external_reference_->Size() - 1);
+        if (external_ticks_ >= external_max_ticks_) {
+          std::cout << "[ExternalRef] protected max tick count reached; stopping" << std::endl;
+          operator_state.stop = true;
+        }
+        return true;
+      } catch (const std::exception& error) {
+        std::cerr << "[ExternalRef][SAFETY STOP] " << error.what() << std::endl;
+        CreateDampingCommand();
+        return false;
+      }
     }
 
     /**
@@ -3834,6 +4049,15 @@ class G1Deploy {
               warn_count++;
             }
             std::cout << "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state" << std::endl;
+            if (external_ref_enabled_) {
+              try {
+                ResetExternalTracking();
+              } catch (const std::exception& error) {
+                std::cerr << "[ExternalRef] cannot arm: " << error.what() << std::endl;
+                operator_state.stop = true;
+                break;
+              }
+            }
             program_state_ = ProgramState::CONTROL;
           }
           break;
@@ -3854,6 +4078,17 @@ class G1Deploy {
             std::cout << "✗ Error: Failed to gather robot state to logger in the middle of the control loop!" << std::endl;
             operator_state.stop = true;
             std::cout << "Stopping control system." << std::endl;
+            return;
+          }
+
+          // The external-reference backend is deliberately a separate control
+          // path: direct hardware observations, its own 1570-D builder, direct
+          // action order, and JSON control parameters. No SONIC observation,
+          // encoder, planner, cursor, or output reorder code runs below.
+          if (external_ref_enabled_) {
+            if (!RunExternalTrackingTick()) {
+              operator_state.stop = true;
+            }
             return;
           }
 
@@ -4143,6 +4378,16 @@ int main(int argc, char const* argv[]) {
     std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
     std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
+    std::cout << "  --policy-type <sonic|external_ref_tracking>: explicit backend (default: sonic)" << std::endl;
+    std::cout << "  --external-reference <path>: external ep100 reference ONNX" << std::endl;
+    std::cout << "  --external-control <path>: metadata-derived control JSON" << std::endl;
+    std::cout << "  --external-init-state <path>: initial-state NPZ" << std::endl;
+    std::cout << "  --external-reference-frames <n>: declared reference length (default: 941)" << std::endl;
+    std::cout << "  --external-max-ticks <n>: protected auto-stop limit (default: 250)" << std::endl;
+    std::cout << "  --external-gain-scale <0..1>: PD pilot scale (default: 0.25)" << std::endl;
+    std::cout << "  --external-max-first-error <rad>: first target guard (default: 0.5)" << std::endl;
+    std::cout << "  --external-max-target-step <rad>: per-tick guard (default: 0.5)" << std::endl;
+    std::cout << "  --external-log <path>: external action/target safety CSV" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
@@ -4188,8 +4433,46 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  bool externalRefEnabled = false;
+  std::string externalReferencePath;
+  std::string externalControlPath;
+  std::string externalInitPath;
+  std::string externalLogPath;
+  std::size_t externalReferenceFrames = 941;
+  std::size_t externalMaxTicks = 250;
+  float externalGainScale = 0.25f;
+  float externalMaxFirstError = 0.5f;
+  float externalMaxTargetStep = 0.5f;
   for (int i = 4; i < argc; i++) {
-    if (std::string(argv[i]) == "--disable-crc-check") {
+    const std::string argument = argv[i];
+    const auto require_value = [&](const std::string& flag) -> std::string {
+      if (i + 1 >= argc) throw std::runtime_error(flag + " requires a value");
+      return argv[++i];
+    };
+    if (argument == "--policy-type") {
+      const std::string value = require_value(argument);
+      if (value == "external_ref_tracking") externalRefEnabled = true;
+      else if (value == "sonic") externalRefEnabled = false;
+      else throw std::runtime_error("--policy-type must be sonic or external_ref_tracking");
+    } else if (argument == "--external-reference") {
+      externalReferencePath = require_value(argument);
+    } else if (argument == "--external-control") {
+      externalControlPath = require_value(argument);
+    } else if (argument == "--external-init-state") {
+      externalInitPath = require_value(argument);
+    } else if (argument == "--external-reference-frames") {
+      externalReferenceFrames = std::stoul(require_value(argument));
+    } else if (argument == "--external-max-ticks") {
+      externalMaxTicks = std::stoul(require_value(argument));
+    } else if (argument == "--external-gain-scale") {
+      externalGainScale = std::stof(require_value(argument));
+    } else if (argument == "--external-max-first-error") {
+      externalMaxFirstError = std::stof(require_value(argument));
+    } else if (argument == "--external-max-target-step") {
+      externalMaxTargetStep = std::stof(require_value(argument));
+    } else if (argument == "--external-log") {
+      externalLogPath = require_value(argument);
+    } else if (argument == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
@@ -4417,6 +4700,20 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else {
+      throw std::runtime_error("unknown command-line argument: " + argument);
+    }
+  }
+
+  if (externalRefEnabled) {
+    if (externalReferencePath.empty() || externalControlPath.empty() ||
+        externalInitPath.empty()) {
+      throw std::runtime_error(
+          "external_ref_tracking requires --external-reference, --external-control, and --external-init-state");
+    }
+    if (!obsConfigPath.empty() || !encoderFile.empty() || !plannerFile.empty()) {
+      throw std::runtime_error(
+          "external_ref_tracking must not receive SONIC obs/encoder/planner flags");
     }
   }
 
@@ -4449,7 +4746,17 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    externalRefEnabled,
+    externalReferencePath,
+    externalControlPath,
+    externalInitPath,
+    externalReferenceFrames,
+    externalMaxTicks,
+    externalGainScale,
+    externalMaxFirstError,
+    externalMaxTargetStep,
+    externalLogPath
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

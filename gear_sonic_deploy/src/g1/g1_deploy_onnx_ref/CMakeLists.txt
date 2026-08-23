@@ -40,6 +40,7 @@ endif()
 
 file(GLOB_RECURSE PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
 list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
+list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/external_ref_dry_run.cpp)
 
 
 # Optional AddressSanitizer support
@@ -215,6 +216,18 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              CXX_EXTENSIONS OFF)
+
+# CPU-only contract/log replay. It does not initialize DDS, publish commands,
+# or touch the robot and is therefore the mandatory first validation stage for
+# the external-reference backend.
+add_executable(external_ref_dry_run
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/external_ref_dry_run.cpp)
+target_include_directories(external_ref_dry_run PUBLIC ${EXE_INCLUDES})
+target_link_libraries(external_ref_dry_run PRIVATE g1_deploy_shared
+  onnxruntime::onnxruntime ZLIB::ZLIB)
+set_target_properties(external_ref_dry_run PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 
 # Optional ROS2 support for main executable and tests
 if(rclcpp_FOUND AND std_msgs_FOUND)
