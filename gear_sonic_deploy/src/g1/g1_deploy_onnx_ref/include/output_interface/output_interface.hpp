@@ -109,6 +109,11 @@ public:
      */
     virtual void publish_config() {}
 
+    /// Embedded tracking reference CSVs are already in direct G1 hardware order.
+    void SetMotionJointsInHardwareOrder(bool enabled) {
+        motion_joints_in_hardware_order_ = enabled;
+    }
+
 protected:
 
     /**
@@ -194,8 +199,11 @@ protected:
         // Populate joint targets if available
         if (has_joint_data) {
           for (int i = 0; i < 29; i++) {
-            body_q_target[i] = current_motion->JointPositions(current_frame)[isaaclab_to_mujoco[i]];
-            body_dq_target[i] = current_motion->JointVelocities(current_frame)[isaaclab_to_mujoco[i]];
+            const int source_index = motion_joints_in_hardware_order_
+                                         ? i
+                                         : isaaclab_to_mujoco[i];
+            body_q_target[i] = current_motion->JointPositions(current_frame)[source_index];
+            body_dq_target[i] = current_motion->JointVelocities(current_frame)[source_index];
           }
         }
 
@@ -277,6 +285,8 @@ protected:
         output_data_map_[kVr3pointOrientation].assign(vr_3point_orientation.begin(), vr_3point_orientation.end());
         output_data_map_[kVr3pointCompliance].assign(vr_3point_compliance.begin(), vr_3point_compliance.end());
     }
+
+    bool motion_joints_in_hardware_order_ = false;
 
     /// Protected constructor – sub-classes must provide a StateLogger reference.
     explicit OutputInterface(StateLogger& logger) : state_logger_(logger) {}

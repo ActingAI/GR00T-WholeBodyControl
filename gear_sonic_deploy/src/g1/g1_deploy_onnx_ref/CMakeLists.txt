@@ -249,7 +249,7 @@ file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
 add_executable(run_tests ${TEST_SRCS})
 target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
 target_link_libraries(run_tests GTest::GTest GTest::Main ${EXE_LIBS})
-target_include_directories(run_tests PUBLIC ${EXE_INCLUDES})
+target_include_directories(run_tests PUBLIC ${EXE_INCLUDES} ${PROJECT_SOURCE_DIR}/src)
 
 # Setting our output directory and C++ standard
 set_target_properties(

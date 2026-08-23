@@ -53,6 +53,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <array>
+#include <deque>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -129,6 +130,9 @@
 
 // Control policy
 #include "../include/control_policy.hpp"
+
+// Opt-in embedded tracking policy (kept independent from SONIC policy/encoder)
+#include "../include/embedded_tracking_policy.hpp"
 
 // Dex3 hands
 #include "../include/dex3_hands.hpp"
@@ -357,6 +361,24 @@ class G1Deploy {
     
     // Control policy
     std::unique_ptr<PolicyEngine> policy_engine_;
+
+    // Explicitly opt-in embedded tracking policy. The default remains SONIC.
+    DeployPolicyType policy_type_ = DeployPolicyType::SONIC;
+    std::unique_ptr<EmbeddedTrackingPolicyEngine> embedded_tracking_engine_;
+    EmbeddedTrackingControlConfig embedded_tracking_control_;
+    EmbeddedTrackingInitState embedded_tracking_init_state_;
+    std::deque<EmbeddedTrackingObservationState> embedded_tracking_history_;
+    EmbeddedTrackingObservationBuilder::Observation embedded_tracking_observation_{};
+    std::array<float, 6> embedded_tracking_anchor_{};
+    std::array<double, G1_NUM_MOTOR> embedded_tracking_q_target_{};
+    int embedded_tracking_time_step_ = 0;
+    int embedded_tracking_max_ticks_ = 0;
+    double embedded_tracking_max_first_target_error_rad_ = 0.5;
+    bool embedded_tracking_finished_ = false;
+    bool embedded_tracking_completion_logged_ = false;
+    bool embedded_tracking_first_command_ = true;
+    bool embedded_tracking_csv_enabled_ = false;
+    std::ofstream embedded_tracking_log_file_;
     
     // =========================================================================
     // Observation system configuration and runtime state
@@ -1975,8 +1997,98 @@ class G1Deploy {
       std::cout << "================================\n" << std::endl;
     }
     
+    void InitializeEmbeddedTrackingHistory() {
+      embedded_tracking_history_.clear();
+      EmbeddedTrackingObservationState initial;
+      initial.base_quat_wxyz = embedded_tracking_init_state_.root_quat_wxyz;
+      initial.joint_pos_mujoco = embedded_tracking_init_state_.body_qpos_mujoco;
+      initial.joint_vel_mujoco = embedded_tracking_init_state_.body_qvel_mujoco;
+      for (size_t i = 0; i < EmbeddedTrackingControlConfig::kHistoryLength; ++i) {
+        embedded_tracking_history_.push_back(initial);
+      }
+      last_action.fill(0.0);
+    }
+
+    bool GatherEmbeddedTrackingObservations() {
+      if (!current_motion_ || current_motion_->timesteps <= 0 ||
+          current_motion_->GetNumBodyQuaternions() < 1) {
+        std::cerr << "Embedded tracking reference motion/root quaternion is unavailable"
+                  << std::endl;
+        return false;
+      }
+      const auto low_state = used_low_state_data_.data;
+      if (!low_state) {
+        std::cerr << "Embedded tracking LowState snapshot is unavailable" << std::endl;
+        return false;
+      }
+
+      EmbeddedTrackingObservationState newest;
+      newest.base_quat_wxyz = float_to_double<4>(low_state->imu_state().quaternion());
+      newest.base_ang_vel = float_to_double<3>(low_state->imu_state().gyroscope());
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        // LowState, control JSON and policy actions all use direct G1 hardware order.
+        newest.joint_pos_mujoco[i] = low_state->motor_state()[i].q();
+        newest.joint_vel_mujoco[i] = low_state->motor_state()[i].dq();
+        newest.previous_raw_actions_mujoco[i] = last_action[i];
+      }
+      embedded_tracking_history_.push_back(newest);
+      while (embedded_tracking_history_.size() >
+             EmbeddedTrackingControlConfig::kHistoryLength) {
+        embedded_tracking_history_.pop_front();
+      }
+
+      std::vector<EmbeddedTrackingObservationState> history(
+          embedded_tracking_history_.begin(), embedded_tracking_history_.end());
+      const int reference_frame = std::clamp(
+          embedded_tracking_time_step_, 0, current_motion_->timesteps - 1);
+      const auto& root_quat = current_motion_->BodyQuaternions(reference_frame)[0];
+      const std::array<double, 4> reference_root_quat = {
+          root_quat[0], root_quat[1], root_quat[2], root_quat[3]};
+      try {
+        embedded_tracking_observation_ = EmbeddedTrackingObservationBuilder::Build(
+            history, embedded_tracking_control_, reference_root_quat);
+        std::copy(embedded_tracking_observation_.begin() + 988,
+                  embedded_tracking_observation_.end(), embedded_tracking_anchor_.begin());
+      } catch (const std::exception& error) {
+        std::cerr << "Failed to build embedded tracking observation: " << error.what()
+                  << std::endl;
+        return false;
+      }
+      return true;
+    }
+
+    void LogEmbeddedTrackingCommand(const TPinnedVector<float>& raw_actions) {
+      if (!embedded_tracking_log_file_.is_open()) { return; }
+      embedded_tracking_log_file_ << embedded_tracking_time_step_;
+      for (float value : raw_actions) { embedded_tracking_log_file_ << ',' << value; }
+      for (double value : embedded_tracking_q_target_) {
+        embedded_tracking_log_file_ << ',' << value;
+      }
+      for (double value : embedded_tracking_control_.joint_stiffness) {
+        embedded_tracking_log_file_ << ',' << value;
+      }
+      for (double value : embedded_tracking_control_.joint_damping) {
+        embedded_tracking_log_file_ << ',' << value;
+      }
+      const auto low_state = used_low_state_data_.data;
+      if (low_state) {
+        for (float value : low_state->imu_state().quaternion()) {
+          embedded_tracking_log_file_ << ',' << value;
+        }
+      } else {
+        embedded_tracking_log_file_ << ",nan,nan,nan,nan";
+      }
+      for (float value : embedded_tracking_anchor_) {
+        embedded_tracking_log_file_ << ',' << value;
+      }
+      embedded_tracking_log_file_ << '\n';
+    }
+
     // Gather observations (simplified - functions read from internal state)
     bool GatherObservations() {
+      if (policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX) {
+        return GatherEmbeddedTrackingObservations();
+      }
       // Clear observation buffer
       std::fill(obs_buffer_.begin(), obs_buffer_.end(), 0.0);
       
@@ -2156,7 +2268,12 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      std::string policy_type = "sonic",
+      std::string tracking_control_path = "",
+      std::string init_state_path = "",
+      int tracking_max_ticks = 0,
+      double tracking_max_first_target_error_rad = 0.5)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2174,6 +2291,10 @@ class G1Deploy {
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        policy_type_(ParseDeployPolicyType(policy_type)),
+        embedded_tracking_max_ticks_(tracking_max_ticks),
+        embedded_tracking_max_first_target_error_rad_(tracking_max_first_target_error_rad),
+        embedded_tracking_csv_enabled_(enable_csv_logs),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
@@ -2290,6 +2411,60 @@ class G1Deploy {
         throw std::runtime_error("Failed to load motion data");
       }
       
+      // Initialize either the legacy SONIC stack or the explicitly selected,
+      // independent two-input embedded tracking runtime.
+      if (policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX) {
+        if (!obs_config_path.empty() || !encoder_file_path.empty() || !planner_path.empty()) {
+          throw std::runtime_error(
+              "embedded_tracking_onnx must not receive SONIC obs/encoder/planner arguments");
+        }
+        embedded_tracking_control_ =
+            EmbeddedTrackingControlConfig::Load(tracking_control_path);
+        embedded_tracking_init_state_ = EmbeddedTrackingInitState::Load(init_state_path);
+        if (!current_motion_ || current_motion_->timesteps != embedded_tracking_control_.frame_count ||
+            current_motion_->GetNumJoints() != G1_NUM_MOTOR ||
+            current_motion_->GetNumBodyQuaternions() < 1) {
+          throw std::runtime_error(
+              "Embedded tracking reference CSV shape/frame_count does not match control JSON");
+        }
+        if (embedded_tracking_max_ticks_ < 0) {
+          throw std::runtime_error("--tracking-max-ticks must be non-negative");
+        }
+        if (!std::isfinite(embedded_tracking_max_first_target_error_rad_) ||
+            embedded_tracking_max_first_target_error_rad_ < 0.0) {
+          throw std::runtime_error(
+              "--tracking-max-first-target-error-rad must be finite and non-negative");
+        }
+
+        const auto& root_quat = current_motion_->BodyQuaternions(0)[0];
+        init_ref_data_root_rot_array_ = {
+            root_quat[0], root_quat[1], root_quat[2], root_quat[3]};
+        heading_state_buffer_.SetData(
+            HeadingState(embedded_tracking_init_state_.root_quat_wxyz, 0.0));
+        InitializeEmbeddedTrackingHistory();
+        obs_buffer_.assign(EmbeddedTrackingControlConfig::kObservationDim, 0.0);
+        initial_encoder_mode_ = -2;
+        is_using_encoder_ = false;
+
+        embedded_tracking_engine_ = std::make_unique<EmbeddedTrackingPolicyEngine>();
+        if (!embedded_tracking_engine_->Initialize(model_path, policy_fp16) ||
+            !embedded_tracking_engine_->CaptureGraph()) {
+          throw std::runtime_error(
+              "Failed to initialize embedded tracking policy from: " + model_path);
+        }
+        std::cout << "✓ Embedded tracking policy selected (SONIC encoder/decoder bypassed)"
+                  << std::endl;
+        std::cout << "  frame_count=" << embedded_tracking_control_.frame_count
+                  << ", fps=" << embedded_tracking_control_.fps
+                  << ", root_height_m=" << embedded_tracking_init_state_.root_height_m
+                  << std::endl;
+        std::cout << "  first-target guard="
+                  << embedded_tracking_max_first_target_error_rad_ << " rad"
+                  << (embedded_tracking_max_first_target_error_rad_ == 0.0
+                          ? " (disabled)"
+                          : "")
+                  << std::endl;
+      } else {
       // Initialize control policy
       policy_engine_ = std::make_unique<PolicyEngine>();
       
@@ -2418,11 +2593,19 @@ class G1Deploy {
       
       // Log observation configuration details
       LogObservationConfiguration();
+      }
 
       // Prepare robot configuration for data collection (after all initialization is complete)
       std::map<std::string, std::variant<std::string, int, double, bool>> robot_config;
       robot_config["model_path"] = model_path;
+      robot_config["policy_type"] = std::string(DeployPolicyTypeName(policy_type_));
       robot_config["reference_motion_path"] = motion_data_path;
+      robot_config["tracking_control_path"] =
+          tracking_control_path.empty() ? "none" : tracking_control_path;
+      robot_config["init_state_path"] = init_state_path.empty() ? "none" : init_state_path;
+      robot_config["tracking_max_ticks"] = embedded_tracking_max_ticks_;
+      robot_config["tracking_max_first_target_error_rad"] =
+          embedded_tracking_max_first_target_error_rad_;
       robot_config["planner_path"] = planner_path.empty() ? "none" : planner_path;
       robot_config["obs_config_path"] = obs_config_path.empty() ? "none" : obs_config_path;
       robot_config["encoder_file"] = encoder_file_path.empty() ? "none" : encoder_file_path;
@@ -2442,6 +2625,35 @@ class G1Deploy {
         std::cerr << "[ERROR] Failed to initialize state logger: " << e.what() << std::endl;
         std::cerr << "State logger is required for operation. Exiting..." << std::endl;
         throw;  // Re-throw to stop program initialization
+      }
+
+      if (policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX &&
+          embedded_tracking_csv_enabled_) {
+        const std::filesystem::path log_path =
+            std::filesystem::path(state_logger_->GetCsvPath()) /
+            "embedded_tracking.csv";
+        embedded_tracking_log_file_.open(log_path);
+        if (!embedded_tracking_log_file_.good()) {
+          throw std::runtime_error(
+              "Cannot open embedded tracking CSV log: " + log_path.string());
+        }
+        embedded_tracking_log_file_ << "time_step";
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          embedded_tracking_log_file_ << ",raw_action_" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          embedded_tracking_log_file_ << ",q_target_" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          embedded_tracking_log_file_ << ",kp_" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          embedded_tracking_log_file_ << ",kd_" << i;
+        }
+        embedded_tracking_log_file_
+            << ",base_qw,base_qx,base_qy,base_qz"
+               ",anchor_r00,anchor_r01,anchor_r10,anchor_r11,anchor_r20,anchor_r21\n";
+        std::cout << "Embedded tracking CSV log: " << log_path << std::endl;
       }
 
       // Initialize input interface based on type
@@ -2551,6 +2763,8 @@ class G1Deploy {
 
       if (create_zmq) {
         auto zmq_handler = std::make_unique<ZMQOutputHandler>(*state_logger_, zmq_out_port, zmq_out_topic);
+        zmq_handler->SetMotionJointsInHardwareOrder(
+            policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX);
         std::cout << "Initialized ZMQ output interface" << std::endl;
         // Publish robot config so subscribers can receive it before control loop starts
         zmq_handler->publish_config();
@@ -2560,6 +2774,8 @@ class G1Deploy {
 #if HAS_ROS2
       if (create_ros2) {
         auto ros2_handler = std::make_unique<ROS2OutputHandler>(*state_logger_, "g1_output_handler");
+        ros2_handler->SetMotionJointsInHardwareOrder(
+            policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX);
         std::cout << "Initialized ROS2 output interface" << std::endl;
         // Publish robot config so subscribers can receive it before control loop starts
         ros2_handler->publish_config();
@@ -2731,19 +2947,30 @@ class G1Deploy {
       }
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        const bool embedded =
+            policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX;
+        const double initial_target = embedded
+                                          ? embedded_tracking_init_state_.body_qpos_mujoco[i]
+                                          : default_angles[i];
         motor_command_tmp.tau_ff.at(i) = 0.0;
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i]);
+        motor_command_tmp.q_target.at(i) = static_cast<float>(initial_target);
         motor_command_tmp.dq_target.at(i) = 0.0;
-        motor_command_tmp.kp.at(i) = kps[i];
-        motor_command_tmp.kd.at(i) = kds[i];
+        motor_command_tmp.kp.at(i) = static_cast<float>(
+            embedded ? embedded_tracking_control_.joint_stiffness[i] : kps[i]);
+        motor_command_tmp.kd.at(i) = static_cast<float>(
+            embedded ? embedded_tracking_control_.joint_damping[i] : kds[i]);
       }
       time_ += control_dt_;
       if (time_ < duration_) {
         for (int i = 0; i < G1_NUM_MOTOR; i++) {
           double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
           double current_pos = ls->motor_state()[i].q();
+          const double initial_target =
+              policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX
+                  ? embedded_tracking_init_state_.body_qpos_mujoco[i]
+                  : default_angles[i];
           motor_command_tmp.q_target.at(i) =
-              static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+              static_cast<float>(current_pos * (1.0 - ratio) + initial_target * ratio);
         }
         dex3_hands_.close(true);
         dex3_hands_.close(false);
@@ -2751,7 +2978,13 @@ class G1Deploy {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
         dex3_hands_.open(true);
         dex3_hands_.open(false);
-        std::cout << "Init Done" << std::endl;
+        std::cout << "Init Done";
+        if (policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX) {
+          std::cout << " (embedded init-state qpos; root height "
+                    << embedded_tracking_init_state_.root_height_m
+                    << " m and root quaternion are observation/reference metadata only)";
+        }
+        std::cout << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -3097,8 +3330,80 @@ class G1Deploy {
      * into the PolicyEngine's pinned input buffer, runs TensorRT inference,
      * then maps the action output (IsaacLab order) to a MotorCommand
      * (hardware order) using `g1_action_scale` and `default_angles`.
-     */
+    */
     bool CreatePolicyCommand() {
+      if (policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX) {
+        if (embedded_tracking_finished_) {
+          return true;  // Hold the final command; never loop the embedded clip.
+        }
+        embedded_tracking_engine_->SetObservation(embedded_tracking_observation_);
+        embedded_tracking_engine_->SetTimeStep(embedded_tracking_time_step_);
+        if (!embedded_tracking_engine_->Infer()) {
+          std::cerr << "✗ Error: Embedded tracking policy inference failed at time_step="
+                    << embedded_tracking_time_step_ << std::endl;
+          return false;
+        }
+        const auto& raw_actions = embedded_tracking_engine_->GetActionBuffer();
+        if (raw_actions.size() != G1_NUM_MOTOR) {
+          std::cerr << "Embedded tracking actions output is not 29 elements" << std::endl;
+          return false;
+        }
+
+        MotorCommand motor_command_tmp;
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          if (!std::isfinite(raw_actions[i])) {
+            std::cerr << "Non-finite embedded tracking action at joint " << i << std::endl;
+            return false;
+          }
+          // Direct hardware order by contract: no IsaacLab/MuJoCo permutation here.
+          last_action[i] = static_cast<double>(raw_actions[i]);
+          embedded_tracking_q_target_[i] =
+              embedded_tracking_control_.JointTarget(
+                  i, static_cast<double>(raw_actions[i]));
+          motor_command_tmp.q_target[i] =
+              static_cast<float>(embedded_tracking_q_target_[i]);
+          motor_command_tmp.dq_target[i] = 0.0f;
+          motor_command_tmp.tau_ff[i] = 0.0f;
+          motor_command_tmp.kp[i] = static_cast<float>(
+              embedded_tracking_control_.joint_stiffness[i]);
+          motor_command_tmp.kd[i] = static_cast<float>(
+              embedded_tracking_control_.joint_damping[i]);
+        }
+
+        if (embedded_tracking_first_command_) {
+          const auto low_state = used_low_state_data_.data;
+          if (!low_state) { return false; }
+          double max_error = 0.0;
+          int max_error_joint = -1;
+          for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+            const double error = std::abs(
+                embedded_tracking_q_target_[i] - low_state->motor_state()[i].q());
+            if (error > max_error) {
+              max_error = error;
+              max_error_joint = i;
+            }
+          }
+          std::cout << "[EmbeddedTracking] first target max |q_target-q_measured|="
+                    << max_error << " rad at hardware joint " << max_error_joint
+                    << std::endl;
+          if (embedded_tracking_max_first_target_error_rad_ > 0.0 &&
+              max_error > embedded_tracking_max_first_target_error_rad_) {
+            std::cerr
+                << "[EmbeddedTracking][SAFETY] First target rejected: " << max_error
+                << " rad exceeds --tracking-max-first-target-error-rad="
+                << embedded_tracking_max_first_target_error_rad_
+                << ". Inspect dry-run/init pose; overriding this guard requires an explicit value."
+                << std::endl;
+            return false;
+          }
+          embedded_tracking_first_command_ = false;
+        }
+
+        motor_command_buffer_.SetData(motor_command_tmp);
+        LogEmbeddedTrackingCommand(raw_actions);
+        return true;
+      }
+
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
       for (size_t i = 0; i < obs_buffer_.size(); i++) { 
@@ -3143,10 +3448,33 @@ class G1Deploy {
      *    which hold the last valid frame while waiting for new data).
      *
      * @return True on success.
-     */
+    */
     bool CurrentFrameAdvancement() {
       // get current motion and frame from planner when planner is enabled and initialized
       std::lock_guard<std::mutex> motion_lock(current_motion_mutex_);
+      if (policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX) {
+        const int requested_frames = embedded_tracking_max_ticks_ > 0
+                                         ? embedded_tracking_max_ticks_
+                                         : embedded_tracking_control_.frame_count;
+        const int terminal_frame =
+            std::min(embedded_tracking_control_.frame_count, requested_frames) - 1;
+        if (embedded_tracking_time_step_ < terminal_frame) {
+          ++embedded_tracking_time_step_;
+          current_frame_ = embedded_tracking_time_step_;
+        } else {
+          embedded_tracking_time_step_ = terminal_frame;
+          current_frame_ = terminal_frame;
+          embedded_tracking_finished_ = true;
+          operator_state.play = false;
+          if (!embedded_tracking_completion_logged_) {
+            std::cout << "[EmbeddedTracking] completed at time_step="
+                      << terminal_frame << "; holding final motor command (no loop)"
+                      << std::endl;
+            embedded_tracking_completion_logged_ = true;
+          }
+        }
+        return true;
+      }
       if (planner_ && planner_->planner_state_.enabled && planner_->planner_state_.initialized) {
         std::lock_guard<std::mutex> planner_lock(planner_->planner_motion_mutex_);
         
@@ -3834,6 +4162,17 @@ class G1Deploy {
               warn_count++;
             }
             std::cout << "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state" << std::endl;
+            if (policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX) {
+              embedded_tracking_time_step_ = 0;
+              current_frame_ = 0;
+              embedded_tracking_finished_ = false;
+              embedded_tracking_completion_logged_ = false;
+              embedded_tracking_first_command_ = true;
+              operator_state.play = true;
+              InitializeEmbeddedTrackingHistory();
+              std::cout << "[EmbeddedTracking] starting once at time_step=0"
+                        << std::endl;
+            }
             program_state_ = ProgramState::CONTROL;
           }
           break;
@@ -3922,7 +4261,9 @@ class G1Deploy {
 
             // Update heading state (handles reinitialize_heading_ and frame-0 init)
             // Must run before any orientation observation functions
-            UpdateHeadingState();
+            if (policy_type_ == DeployPolicyType::SONIC) {
+              UpdateHeadingState();
+            }
 
             // Gather all observations using modular functions
             // This may update token_state_data_ with encoder output (if encoder is used)
@@ -4024,7 +4365,13 @@ class G1Deploy {
             (*target_motion_file_) << current_motion_copy->BodyQuaternions(current_frame_copy)[0][3] << ",";
 
             for(int i = 0; i < 29; i++) {
-              (*target_motion_file_) << current_motion_copy->JointPositions(current_frame_copy)[isaaclab_to_mujoco[i]] << ",";
+              const int reference_index =
+                  policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX
+                      ? i
+                      : isaaclab_to_mujoco[i];
+              (*target_motion_file_)
+                  << current_motion_copy->JointPositions(current_frame_copy)[reference_index]
+                  << ",";
             }
 
             (*target_motion_file_) << std::endl;
@@ -4033,9 +4380,15 @@ class G1Deploy {
           if(policy_input_file_)
           {
             // dump neural network inputs to a log file:
-            for(auto d : obs_buffer_)
-            {
-              (*policy_input_file_) << d << ",";
+            if (policy_type_ == DeployPolicyType::EMBEDDED_TRACKING_ONNX) {
+              for (float value : embedded_tracking_observation_) {
+                (*policy_input_file_) << value << ",";
+              }
+              (*policy_input_file_) << embedded_tracking_time_step_ << ",";
+            } else {
+              for (double value : obs_buffer_) {
+                (*policy_input_file_) << value << ",";
+              }
             }
             (*policy_input_file_) << std::endl;
           }
@@ -4090,6 +4443,88 @@ class G1Deploy {
     }
 };
 
+int RunEmbeddedTrackingDryRun(const std::string& model_path,
+                              const std::string& motion_data_path,
+                              const std::string& control_path,
+                              const std::string& init_state_path,
+                              bool use_fp16,
+                              double max_first_target_error_rad) {
+  std::cout << "[EmbeddedTracking][DryRun] validating package without DDS/motor output"
+            << std::endl;
+  const auto control = EmbeddedTrackingControlConfig::Load(control_path);
+  const auto init = EmbeddedTrackingInitState::Load(init_state_path);
+  MotionDataReader motion_reader;
+  if (!motion_reader.ReadFromCSV(motion_data_path) || motion_reader.motions.size() != 1) {
+    throw std::runtime_error(
+        "Dry-run expects exactly one valid embedded tracking motion directory");
+  }
+  const auto motion = motion_reader.motions.front();
+  if (!motion || motion->timesteps != control.frame_count ||
+      motion->GetNumJoints() != G1_NUM_MOTOR ||
+      motion->GetNumBodyQuaternions() < 1) {
+    throw std::runtime_error("Dry-run reference CSV dimensions do not match control JSON");
+  }
+
+  EmbeddedTrackingObservationState initial;
+  initial.base_quat_wxyz = init.root_quat_wxyz;
+  initial.joint_pos_mujoco = init.body_qpos_mujoco;
+  initial.joint_vel_mujoco = init.body_qvel_mujoco;
+  std::vector<EmbeddedTrackingObservationState> history(
+      EmbeddedTrackingControlConfig::kHistoryLength, initial);
+  const auto& q_ref = motion->BodyQuaternions(0)[0];
+  const std::array<double, 4> reference_root_quat = {
+      q_ref[0], q_ref[1], q_ref[2], q_ref[3]};
+  const auto observation = EmbeddedTrackingObservationBuilder::Build(
+      history, control, reference_root_quat);
+  for (size_t i = 930; i < 988; ++i) {
+    if (observation[i] != 0.0f) {
+      throw std::runtime_error("Dry-run reserved observation slice 930:988 is not zero");
+    }
+  }
+
+  EmbeddedTrackingPolicyEngine engine;
+  if (!engine.Initialize(model_path, use_fp16) || !engine.CaptureGraph()) {
+    throw std::runtime_error("Dry-run TensorRT initialization/capture failed");
+  }
+  engine.SetObservation(observation);
+  engine.SetTimeStep(0);
+  if (!engine.Infer()) {
+    throw std::runtime_error("Dry-run TensorRT frame-0 inference failed");
+  }
+  const auto& actions = engine.GetActionBuffer();
+  if (actions.size() != G1_NUM_MOTOR) {
+    throw std::runtime_error("Dry-run actions output is not 29 elements");
+  }
+  double max_delta = 0.0;
+  int max_delta_joint = -1;
+  for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+    if (!std::isfinite(actions[i])) {
+      throw std::runtime_error("Dry-run actions output contains a non-finite value");
+    }
+    // Deliberately direct hardware order; this is also the q-target mapping check.
+    const double q_target = control.JointTarget(i, static_cast<double>(actions[i]));
+    const double delta = std::abs(q_target - init.body_qpos_mujoco[i]);
+    if (delta > max_delta) {
+      max_delta = delta;
+      max_delta_joint = i;
+    }
+  }
+
+  std::cout << "[EmbeddedTracking][DryRun] PASS: obs[1,994], time_step[1,1], "
+               "actions[1,29], finite anchor, direct hardware-order q_target"
+            << std::endl;
+  std::cout << "[EmbeddedTracking][DryRun] frame_count=" << control.frame_count
+            << ", clamped final time_step=" << control.frame_count - 1 << std::endl;
+  std::cout << "[EmbeddedTracking][DryRun] first target vs common init max delta="
+            << max_delta << " rad at hardware joint " << max_delta_joint << std::endl;
+  if (max_first_target_error_rad > 0.0 && max_delta > max_first_target_error_rad) {
+    std::cerr << "[EmbeddedTracking][DryRun][SAFETY] FAIL: first target delta exceeds "
+              << max_first_target_error_rad << " rad" << std::endl;
+    return 2;
+  }
+  return 0;
+}
+
 /**
  * @brief Entry point: parse CLI arguments and run the G1 deployment application.
  *
@@ -4111,6 +4546,12 @@ int main(int argc, char const* argv[]) {
     std::cout << "  motion_data_path: path to motion data directory (e.g., reference/bones_072925_test/)" << std::endl;
     std::cout << "\nOptions:" << std::endl;
     std::cout << "  --planner-file <path>: specify planner file (optional)" << std::endl;
+    std::cout << "  --policy-type <sonic|embedded_tracking_onnx>: deployment runtime (default: sonic)" << std::endl;
+    std::cout << "  --tracking-control <path>: embedded tracking control JSON" << std::endl;
+    std::cout << "  --init-state <path>: embedded tracking common_initial_state.npz" << std::endl;
+    std::cout << "  --tracking-max-ticks <n>: optional embedded pilot tick limit (0 = full clip)" << std::endl;
+    std::cout << "  --tracking-max-first-target-error-rad <rad>: first-command guard (default: 0.5; 0 disables)" << std::endl;
+    std::cout << "  --embedded-tracking-dry-run: validate TensorRT/package and exit without DDS" << std::endl;
     std::cout << "  --input-type <keyboard|gamepad|gamepad_manager|manager|zmq|zmq_manager";
 #if HAS_ROS2
     std::cout << "|ros2";
@@ -4162,6 +4603,12 @@ int main(int argc, char const* argv[]) {
   std::string modelFile = argv[2];
   std::string motionDataPath = argv[3];
   std::string plannerFile = "";
+  std::string policyType = "sonic";
+  std::string trackingControlPath = "";
+  std::string initStatePath = "";
+  int trackingMaxTicks = 0;
+  double trackingMaxFirstTargetErrorRad = 0.5;
+  bool embeddedTrackingDryRun = false;
 
   // Parse optional arguments
   bool disableCrcCheck = false;\
@@ -4192,6 +4639,45 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--policy-type") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --policy-type requires a value" << std::endl;
+        exit(1);
+      }
+      policyType = argv[++i];
+      try {
+        (void)ParseDeployPolicyType(policyType);
+      } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--tracking-control") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --tracking-control requires a path" << std::endl;
+        exit(1);
+      }
+      trackingControlPath = argv[++i];
+    } else if (std::string(argv[i]) == "--init-state") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --init-state requires a path" << std::endl;
+        exit(1);
+      }
+      initStatePath = argv[++i];
+    } else if (std::string(argv[i]) == "--tracking-max-ticks") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --tracking-max-ticks requires an integer" << std::endl;
+        exit(1);
+      }
+      trackingMaxTicks = std::stoi(argv[++i]);
+    } else if (std::string(argv[i]) == "--tracking-max-first-target-error-rad") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --tracking-max-first-target-error-rad requires a value"
+                  << std::endl;
+        exit(1);
+      }
+      trackingMaxFirstTargetErrorRad = std::stod(argv[++i]);
+    } else if (std::string(argv[i]) == "--embedded-tracking-dry-run") {
+      embeddedTrackingDryRun = true;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4420,6 +4906,43 @@ int main(int argc, char const* argv[]) {
     }
   }
 
+  const DeployPolicyType parsedPolicyType = ParseDeployPolicyType(policyType);
+  if (parsedPolicyType == DeployPolicyType::EMBEDDED_TRACKING_ONNX) {
+    if (trackingControlPath.empty() || initStatePath.empty()) {
+      std::cerr << "Error: embedded_tracking_onnx requires --tracking-control and --init-state"
+                << std::endl;
+      return 1;
+    }
+    if (!obsConfigPath.empty() || !encoderFile.empty() || !plannerFile.empty()) {
+      std::cerr << "Error: embedded_tracking_onnx is independent of SONIC "
+                   "--obs-config/--encoder-file/--planner-file"
+                << std::endl;
+      return 1;
+    }
+    if (trackingMaxTicks < 0 || !std::isfinite(trackingMaxFirstTargetErrorRad) ||
+        trackingMaxFirstTargetErrorRad < 0.0) {
+      std::cerr << "Error: embedded tracking limits must be finite and non-negative"
+                << std::endl;
+      return 1;
+    }
+  } else if (embeddedTrackingDryRun) {
+    std::cerr << "Error: --embedded-tracking-dry-run requires "
+                 "--policy-type embedded_tracking_onnx"
+              << std::endl;
+    return 1;
+  }
+
+  if (embeddedTrackingDryRun) {
+    try {
+      return RunEmbeddedTrackingDryRun(
+          modelFile, motionDataPath, trackingControlPath, initStatePath,
+          policyFp16, trackingMaxFirstTargetErrorRad);
+    } catch (const std::exception& error) {
+      std::cerr << "[EmbeddedTracking][DryRun] ERROR: " << error.what() << std::endl;
+      return 1;
+    }
+  }
+
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
   G1Deploy custom(
     networkInterface,
@@ -4449,7 +4972,12 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    policyType,
+    trackingControlPath,
+    initStatePath,
+    trackingMaxTicks,
+    trackingMaxFirstTargetErrorRad
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

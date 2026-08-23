@@ -129,6 +129,9 @@ class StateLogger {
    */
   std::optional<std::map<std::string, std::variant<std::string, int, double, bool>>> GetConfig() const;
 
+  /** Return the resolved directory used by the split CSV logger. */
+  const std::string& GetCsvPath() const { return csv_path_; }
+
   /**
    * Construct a logger.
    * @param csv_dir        Directory path for split CSV files (one file per signal)

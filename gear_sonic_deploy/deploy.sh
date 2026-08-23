@@ -208,6 +208,13 @@ show_usage() {
     echo "  --obs-config PATH       Set the observation config file (default: policy/configs/example.yaml)"
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
     echo "  --motion-data PATH      Set the motion data path (default: reference/example_motion/)"
+    echo "  --policy-type TYPE      sonic (default) or embedded_tracking_onnx"
+    echo "  --tracking-onnx PATH    Embedded tracking ONNX (required for embedded mode)"
+    echo "  --tracking-control PATH Embedded tracking control JSON"
+    echo "  --init-state PATH       Embedded tracking common_initial_state.npz"
+    echo "  --tracking-max-ticks N  Optional embedded pilot limit (0 = full clip)"
+    echo "  --tracking-max-first-target-error-rad RAD  First-command guard (default: 0.5)"
+    echo "  --embedded-tracking-dry-run  Validate package/TensorRT and exit without DDS"
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
@@ -242,6 +249,7 @@ MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
+POLICY_TYPE_DEFAULT="sonic"
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -251,6 +259,14 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+POLICY_TYPE="$POLICY_TYPE_DEFAULT"
+TRACKING_ONNX=""
+TRACKING_CONTROL=""
+INIT_STATE=""
+TRACKING_MAX_TICKS="0"
+TRACKING_MAX_FIRST_TARGET_ERROR_RAD="0.5"
+EMBEDDED_TRACKING_DRY_RUN=false
+INPUT_TYPE_WAS_SET=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -291,12 +307,41 @@ while [[ $# -gt 0 ]]; do
             MOTION_DATA="$2"
             shift 2
             ;;
+        --policy-type)
+            POLICY_TYPE="$2"
+            shift 2
+            ;;
+        --tracking-onnx)
+            TRACKING_ONNX="$2"
+            shift 2
+            ;;
+        --tracking-control)
+            TRACKING_CONTROL="$2"
+            shift 2
+            ;;
+        --init-state)
+            INIT_STATE="$2"
+            shift 2
+            ;;
+        --tracking-max-ticks)
+            TRACKING_MAX_TICKS="$2"
+            shift 2
+            ;;
+        --tracking-max-first-target-error-rad)
+            TRACKING_MAX_FIRST_TARGET_ERROR_RAD="$2"
+            shift 2
+            ;;
+        --embedded-tracking-dry-run)
+            EMBEDDED_TRACKING_DRY_RUN=true
+            shift
+            ;;
         --input-type)
             if [[ -z "$2" ]]; then
                 echo -e "${RED}Error: --input-type requires a type argument${NC}" >&2
                 exit 1
             fi
             INPUT_TYPE="$2"
+            INPUT_TYPE_WAS_SET=true
             shift 2
             ;;
         --output-type)
@@ -326,6 +371,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$POLICY_TYPE" != "sonic" && "$POLICY_TYPE" != "embedded_tracking_onnx" ]]; then
+    echo -e "${RED}Error: --policy-type must be sonic or embedded_tracking_onnx${NC}" >&2
+    exit 1
+fi
+if [[ "$POLICY_TYPE" == "embedded_tracking_onnx" && "$INPUT_TYPE_WAS_SET" == false ]]; then
+    INPUT_TYPE="keyboard"
+fi
 
 # ============================================================================
 # Display Header
@@ -423,10 +476,20 @@ echo ""
 echo "Checking required model files..."
 MISSING_FILES=0
 
-check_file "$CHECKPOINT_DECODER" || MISSING_FILES=$((MISSING_FILES + 1))
-check_file "$CHECKPOINT_ENCODER" || MISSING_FILES=$((MISSING_FILES + 1))
-check_file "$OBS_CONFIG" || MISSING_FILES=$((MISSING_FILES + 1))
-check_file "$PLANNER" || MISSING_FILES=$((MISSING_FILES + 1))
+if [[ "$POLICY_TYPE" == "embedded_tracking_onnx" ]]; then
+    if [[ -z "$TRACKING_ONNX" || -z "$TRACKING_CONTROL" || -z "$INIT_STATE" ]]; then
+        echo -e "${RED}❌ Embedded mode requires --tracking-onnx, --tracking-control and --init-state${NC}" >&2
+        exit 1
+    fi
+    check_file "$TRACKING_ONNX" || MISSING_FILES=$((MISSING_FILES + 1))
+    check_file "$TRACKING_CONTROL" || MISSING_FILES=$((MISSING_FILES + 1))
+    check_file "$INIT_STATE" || MISSING_FILES=$((MISSING_FILES + 1))
+else
+    check_file "$CHECKPOINT_DECODER" || MISSING_FILES=$((MISSING_FILES + 1))
+    check_file "$CHECKPOINT_ENCODER" || MISSING_FILES=$((MISSING_FILES + 1))
+    check_file "$OBS_CONFIG" || MISSING_FILES=$((MISSING_FILES + 1))
+    check_file "$PLANNER" || MISSING_FILES=$((MISSING_FILES + 1))
+fi
 
 if [ -d "$MOTION_DATA" ]; then
     echo -e "${GREEN}✅ Found: $MOTION_DATA${NC}"
@@ -507,11 +570,23 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 echo -e "  Environment:        ${GREEN}$ENV_TYPE${NC}"
 echo -e "  Network Interface:  ${GREEN}$TARGET${NC}"
+echo -e "  Policy Type:        ${GREEN}$POLICY_TYPE${NC}"
+if [[ "$POLICY_TYPE" == "embedded_tracking_onnx" ]]; then
+echo -e "  Tracking ONNX:      ${GREEN}$TRACKING_ONNX${NC}"
+echo -e "  Tracking Control:   ${GREEN}$TRACKING_CONTROL${NC}"
+echo -e "  Init State:         ${GREEN}$INIT_STATE${NC}"
+echo -e "  Max Ticks:          ${GREEN}$TRACKING_MAX_TICKS${NC}"
+echo -e "  First Target Guard: ${GREEN}$TRACKING_MAX_FIRST_TARGET_ERROR_RAD rad${NC}"
+echo -e "  Dry Run:            ${GREEN}$EMBEDDED_TRACKING_DRY_RUN${NC}"
+else
 echo -e "  Decoder Model:      ${GREEN}$CHECKPOINT_DECODER${NC}"
 echo -e "  Encoder Model:      ${GREEN}$CHECKPOINT_ENCODER${NC}"
+fi
 echo -e "  Motion Data:        ${GREEN}$MOTION_DATA${NC}"
+if [[ "$POLICY_TYPE" == "sonic" ]]; then
 echo -e "  Obs Config:         ${GREEN}$OBS_CONFIG${NC}"
 echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
+fi
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
@@ -523,10 +598,22 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 echo -e "${YELLOW}The following command will be executed:${NC}"
 echo ""
+if [[ "$POLICY_TYPE" == "embedded_tracking_onnx" ]]; then
+echo -e "${BLUE}just run g1_deploy_onnx_ref $TARGET $TRACKING_ONNX $MOTION_DATA \\${NC}"
+echo -e "${BLUE}    --policy-type embedded_tracking_onnx \\${NC}"
+echo -e "${BLUE}    --tracking-control $TRACKING_CONTROL \\${NC}"
+echo -e "${BLUE}    --init-state $INIT_STATE \\${NC}"
+echo -e "${BLUE}    --tracking-max-ticks $TRACKING_MAX_TICKS \\${NC}"
+echo -e "${BLUE}    --tracking-max-first-target-error-rad $TRACKING_MAX_FIRST_TARGET_ERROR_RAD \\${NC}"
+if [[ "$EMBEDDED_TRACKING_DRY_RUN" == true ]]; then
+echo -e "${BLUE}    --embedded-tracking-dry-run \\${NC}"
+fi
+else
 echo -e "${BLUE}just run g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
 echo -e "${BLUE}    --obs-config $OBS_CONFIG \\${NC}"
 echo -e "${BLUE}    --encoder-file $CHECKPOINT_ENCODER \\${NC}"
 echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
+fi
 echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
@@ -551,24 +638,46 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo -e "${GREEN}🚀 Starting deployment...${NC}"
     echo ""
     
-    # Build the command with optional extra args
-    if [[ -n "$EXTRA_ARGS" ]]; then
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
+    if [[ "$POLICY_TYPE" == "embedded_tracking_onnx" ]]; then
+        EMBEDDED_DRY_RUN_ARG=()
+        if [[ "$EMBEDDED_TRACKING_DRY_RUN" == true ]]; then
+            EMBEDDED_DRY_RUN_ARG=(--embedded-tracking-dry-run)
+        fi
+        EXTRA_ARGS_ARRAY=()
+        if [[ -n "$EXTRA_ARGS" ]]; then
+            EXTRA_ARGS_ARRAY=($EXTRA_ARGS)
+        fi
+        just run g1_deploy_onnx_ref "$TARGET" "$TRACKING_ONNX" "$MOTION_DATA" \
+            --policy-type embedded_tracking_onnx \
+            --tracking-control "$TRACKING_CONTROL" \
+            --init-state "$INIT_STATE" \
+            --tracking-max-ticks "$TRACKING_MAX_TICKS" \
+            --tracking-max-first-target-error-rad "$TRACKING_MAX_FIRST_TARGET_ERROR_RAD" \
             --input-type "$INPUT_TYPE" \
             --output-type "$OUTPUT_TYPE" \
             --zmq-host "$ZMQ_HOST" \
-            $EXTRA_ARGS
+            "${EMBEDDED_DRY_RUN_ARG[@]}" \
+            "${EXTRA_ARGS_ARRAY[@]}"
     else
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST"
+        # Keep the legacy SONIC command line unchanged by default.
+        if [[ -n "$EXTRA_ARGS" ]]; then
+            just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST" \
+                $EXTRA_ARGS
+        else
+            just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST"
+        fi
     fi
 else
     echo ""
