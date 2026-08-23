@@ -131,9 +131,11 @@ public:
      * @param port    TCP port to bind the PUB socket to (e.g. 5557).
      * @param topic   Topic prefix prepended to each published message.
      */
-    explicit ZMQOutputHandler(StateLogger& logger, int port, const std::string& topic) 
+    explicit ZMQOutputHandler(StateLogger& logger, int port, const std::string& topic,
+                              bool action_is_hardware_order = false)
         : OutputInterface(logger), realtime_debug_context_(1), topic_(topic),
-          robot_config_topic_("robot_config") {
+          robot_config_topic_("robot_config"),
+          action_is_hardware_order_(action_is_hardware_order) {
 
         std::cout << "Initializing realtime debug socket" << std::endl;
         std::cout << "Binding to port: " << port << " and topic: " << topic_ << std::endl;
@@ -238,6 +240,7 @@ private:
 
     std::string topic_;              ///< User-provided topic name (e.g. "g1_debug") for combined state+viz.
     std::string robot_config_topic_; ///< Topic for robot config messages.
+    bool action_is_hardware_order_ = false;
 
     msgpack::sbuffer state_data_sbuf_;  ///< Reused each tick; cleared in pack_combined_state().
 
@@ -366,10 +369,14 @@ private:
             for (const auto& val : state.body_dq) pk.pack(val);
         }
 
-        // last_action: IsaacLab -> MuJoCo order, scale + default-angle offset
+        // SONIC stores raw action in IsaacLab order and historically publishes
+        // its q-target conversion here. The external-reference backend stores
+        // raw action directly in hardware order and must not be reordered.
         pk.pack("last_action");
         pk.pack_array(state.last_action.size());
-        if (state.last_action.size() == 29) {
+        if (state.last_action.size() == 29 && action_is_hardware_order_) {
+            for (const auto& val : state.last_action) pk.pack(val);
+        } else if (state.last_action.size() == 29) {
             std::array<double, 29> last_action_mujoco;
             for (size_t i = 0; i < 29; ++i)
                 last_action_mujoco[i] = state.last_action[isaaclab_to_mujoco[i]] * g1_action_scale[i] + default_angles[i];

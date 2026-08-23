@@ -436,6 +436,19 @@ class ObservationBuilder {
 
   Observation Build(const ReferenceProvider& reference, std::size_t frame_index,
                     const QuatArray& robot_quat_wxyz) const {
+    std::array<ReferenceFrame, kFutureFrames> window{};
+    for (std::size_t future = 0; future < kFutureFrames; ++future) {
+      const std::size_t selected = std::min(
+          frame_index + static_cast<std::size_t>(kFutureOffsets[future]),
+          reference.Size() - 1);
+      window[future] = reference.Frame(selected);
+    }
+    return Build(window, robot_quat_wxyz);
+  }
+
+  Observation Build(
+      const std::array<ReferenceFrame, kFutureFrames>& reference_window,
+      const QuatArray& robot_quat_wxyz) const {
     RequireInitialized();
     Observation observation{};
     CopyFrames(gravity_history_, observation, 0);
@@ -446,11 +459,7 @@ class ObservationBuilder {
 
     std::size_t future_joint_offset = 930;
     std::size_t future_anchor_offset = 1510;
-    for (std::size_t future = 0; future < kFutureFrames; ++future) {
-      const std::size_t selected = std::min(
-          frame_index + static_cast<std::size_t>(kFutureOffsets[future]),
-          reference.Size() - 1);
-      const auto& frame = reference.Frame(selected);
+    for (const auto& frame : reference_window) {
       std::copy(frame.joint_pos.begin(), frame.joint_pos.end(),
                 observation.begin() + future_joint_offset);
       future_joint_offset += kJointCount;

@@ -362,6 +362,7 @@ class G1Deploy {
     // Opt-in external-reference backend. The default SONIC backend never
     // reads these fields and retains its original observation/action path.
     bool external_ref_enabled_ = false;
+    bool external_ref_stream_source_ = false;
     external_ref_tracking::ControlConfig external_control_;
     external_ref_tracking::InitialState external_initial_state_;
     std::unique_ptr<external_ref_tracking::ReferenceProvider> external_reference_;
@@ -375,6 +376,8 @@ class G1Deploy {
     bool external_first_command_ = true;
     external_ref_tracking::JointArray external_previous_target_{};
     std::unique_ptr<std::ofstream> external_log_file_;
+    std::shared_ptr<const MotionSequence> external_motion_snapshot_;
+    int external_motion_frame_snapshot_ = 0;
     
     // =========================================================================
     // Observation system configuration and runtime state
@@ -2176,6 +2179,7 @@ class G1Deploy {
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
       bool external_ref_enabled = false,
+      bool external_ref_stream_source = false,
       std::string external_reference_path = "",
       std::string external_control_path = "",
       std::string external_init_path = "",
@@ -2207,25 +2211,31 @@ class G1Deploy {
         planner_path(planner_file_path) {
 
       external_ref_enabled_ = external_ref_enabled;
+      external_ref_stream_source_ = external_ref_stream_source;
       if (external_ref_enabled_) {
-        if (!obs_config_path.empty() || !encoder_file_path.empty() || !planner_file_path.empty()) {
+        if (!obs_config_path.empty() || !encoder_file_path.empty() ||
+            (!external_ref_stream_source_ && !planner_file_path.empty())) {
           throw std::runtime_error(
-              "external_ref_tracking forbids SONIC obs config, encoder, and planner");
+              "external_ref_tracking forbids SONIC obs config/encoder; planner is only valid with stream reference");
         }
-        if (external_reference_path.empty() || external_control_path.empty() ||
-            external_init_path.empty() || external_max_ticks == 0 ||
+        if ((!external_ref_stream_source_ && external_reference_path.empty()) ||
+            external_control_path.empty() || external_init_path.empty() ||
             external_gain_scale <= 0.0f || external_gain_scale > 1.0f ||
             external_max_first_error < 0.0f || external_max_target_step < 0.0f) {
           throw std::runtime_error("invalid external-reference safety/config arguments");
         }
         external_control_ = external_ref_tracking::ControlConfig::Load(external_control_path);
         external_initial_state_ = external_ref_tracking::InitialState::Load(external_init_path);
-        external_reference_ = std::make_unique<external_ref_tracking::ReferenceProvider>(
-            external_reference_path, external_reference_frames);
         const auto policy_names = external_ref_tracking::ReadOnnxJointNames(model_path);
-        if (policy_names != external_control_.joint_names ||
-            policy_names != external_reference_->JointNames()) {
+        if (policy_names != external_control_.joint_names) {
           throw std::runtime_error("external policy/reference/control joint order mismatch");
+        }
+        if (!external_ref_stream_source_) {
+          external_reference_ = std::make_unique<external_ref_tracking::ReferenceProvider>(
+              external_reference_path, external_reference_frames);
+          if (policy_names != external_reference_->JointNames()) {
+            throw std::runtime_error("external policy/reference joint order mismatch");
+          }
         }
         external_obs_builder_ = std::make_unique<external_ref_tracking::ObservationBuilder>(
             external_control_);
@@ -2233,7 +2243,19 @@ class G1Deploy {
         external_gain_scale_ = external_gain_scale;
         external_max_first_error_ = external_max_first_error;
         external_max_target_step_ = external_max_target_step;
-        initial_encoder_mode_ = -2;
+        vr_3point_position_buffer_.fill(0.0);
+        vr_3point_orientation_buffer_.fill(0.0);
+        vr_3point_compliance_buffer_.fill(0.0);
+        vr_5point_position_buffer_.fill(0.0);
+        vr_5point_orientation_buffer_.fill(0.0);
+        left_hand_joint_buffer_.fill(0.0);
+        right_hand_joint_buffer_.fill(0.0);
+        upper_body_joint_positions_buffer_.fill(0.0);
+        upper_body_joint_velocities_buffer_.fill(0.0);
+        init_ref_data_root_rot_array_.fill(0.0);
+        // Protocol compatibility marker for the established K/I/P replay
+        // collector. No SONIC encoder is executed by this backend.
+        initial_encoder_mode_ = external_ref_stream_source_ ? 0 : -2;
         if (!external_log_path.empty()) {
           external_log_file_ = std::make_unique<std::ofstream>(external_log_path, std::ios::trunc);
           if (!external_log_file_->good()) {
@@ -2251,8 +2273,10 @@ class G1Deploy {
           }
           (*external_log_file_) << '\n';
         }
-        std::cout << "[ExternalRef] preflight PASS: 29 direct hardware-order joints, "
-                  << external_reference_->Size() << " frames, gain_scale="
+        std::cout << "[ExternalRef] preflight PASS: 29 direct hardware-order joints, source="
+                  << (external_ref_stream_source_ ? "zmq_stream" : "onnx_reference")
+                  << (external_reference_ ? ", frames=" + std::to_string(external_reference_->Size()) : "")
+                  << ", gain_scale="
                   << external_gain_scale_ << ", max_ticks=" << external_max_ticks_ << std::endl;
         std::cout << "[ExternalRef] SONIC output reorder applied: false" << std::endl;
       }
@@ -2338,8 +2362,10 @@ class G1Deploy {
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
       imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
-      // Load SONIC motion data only for the unchanged SONIC backend.
-      if (!external_ref_enabled_ && motion_reader_.ReadFromCSV(motion_data_path)) {
+      // The ZMQ-stream backend retains the established SONIC motion/planner
+      // transport; only the tracking policy backend is replaced.
+      const bool needs_motion_transport = !external_ref_enabled_ || external_ref_stream_source_;
+      if (needs_motion_transport && motion_reader_.ReadFromCSV(motion_data_path)) {
         if (!motion_reader_.motions.empty()) {
           std::cout << "✓ Motion data loaded successfully!" << std::endl;
           // motion_reader_.PrintSummary();
@@ -2361,7 +2387,7 @@ class G1Deploy {
           std::cout << "Exiting..." << std::endl;
           throw std::runtime_error("No valid motions found in motion data directory");
         }
-      } else if (!external_ref_enabled_) {
+      } else if (needs_motion_transport) {
         std::cout << "✗ Error: Could not access motion data from " << motion_data_path << std::endl;
         std::cout << "Make sure the path exists and contains motion folders." << std::endl;
         std::cout << "Control system cannot function without motion data!" << std::endl;
@@ -2503,8 +2529,25 @@ class G1Deploy {
       LogObservationConfiguration();
       } else {
         is_using_encoder_ = false;
-        planner_path.clear();
-        std::cout << "[ExternalRef] SONIC observation registry/encoder/planner bypassed" << std::endl;
+        if (external_ref_stream_source_ && !planner_path.empty()) {
+          PlannerConfig planner_config;
+          planner_config.model_path = planner_path;
+          if (planner_path.find("V0") != std::string::npos) planner_config.version = 0;
+          else if (planner_path.find("V1") != std::string::npos) planner_config.version = 1;
+          else if (planner_path.find("V2") != std::string::npos) planner_config.version = 2;
+          else throw std::runtime_error("Unsupported planner version: " + planner_path);
+          planner_ = std::make_unique<LocalMotionPlannerTensorRT>(
+              planner_fp16, 0, planner_config);
+        } else {
+          planner_path.clear();
+        }
+        for (auto& motion : motion_reader_.motions) {
+          motion->SetEncodeMode(initial_encoder_mode_);
+        }
+        planner_motion_->SetEncodeMode(initial_encoder_mode_);
+        std::cout << "[ExternalRef] SONIC observation registry/encoder bypassed; "
+                  << "existing motion/planner/ZMQ transport="
+                  << (external_ref_stream_source_ ? "enabled" : "disabled") << std::endl;
       }
 
       // Prepare robot configuration for data collection (after all initialization is complete)
@@ -2639,7 +2682,9 @@ class G1Deploy {
 #endif
 
       if (create_zmq) {
-        auto zmq_handler = std::make_unique<ZMQOutputHandler>(*state_logger_, zmq_out_port, zmq_out_topic);
+        auto zmq_handler = std::make_unique<ZMQOutputHandler>(
+            *state_logger_, zmq_out_port, zmq_out_topic,
+            external_ref_enabled_);
         std::cout << "Initialized ZMQ output interface" << std::endl;
         // Publish robot config so subscribers can receive it before control loop starts
         zmq_handler->publish_config();
@@ -2822,7 +2867,9 @@ class G1Deploy {
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
         motor_command_tmp.tau_ff.at(i) = 0.0;
         const float init_target = external_ref_enabled_
-            ? external_reference_->Frame(0).joint_pos[i]
+            ? (external_ref_stream_source_
+                   ? external_control_.default_joint_pos[i]
+                   : external_reference_->Frame(0).joint_pos[i])
             : static_cast<float>(default_angles[i]);
         motor_command_tmp.q_target.at(i) = init_target;
         motor_command_tmp.dq_target.at(i) = 0.0;
@@ -2837,7 +2884,10 @@ class G1Deploy {
           double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
           double current_pos = ls->motor_state()[i].q();
           const double init_target = external_ref_enabled_
-              ? external_reference_->Frame(0).joint_pos[i] : default_angles[i];
+              ? (external_ref_stream_source_
+                     ? external_control_.default_joint_pos[i]
+                     : external_reference_->Frame(0).joint_pos[i])
+              : default_angles[i];
           motor_command_tmp.q_target.at(i) =
               static_cast<float>(current_pos * (1.0 - ratio) + init_target * ratio);
         }
@@ -3262,8 +3312,47 @@ class G1Deploy {
       try {
         const auto state = GatherExternalRobotState();
         external_obs_builder_->PushRobotState(state);
-        const auto observation = external_obs_builder_->Build(
-            *external_reference_, external_frame_, state.base_quat_wxyz);
+        std::size_t reference_cursor = external_frame_;
+        external_ref_tracking::Observation observation{};
+        if (external_ref_stream_source_) {
+          std::array<external_ref_tracking::ReferenceFrame,
+                     external_ref_tracking::kFutureFrames> window{};
+          std::lock_guard<std::mutex> lock(current_motion_mutex_);
+          if (!current_motion_ || current_motion_->timesteps < 1 ||
+              current_motion_->GetNumJoints() != G1_NUM_MOTOR ||
+              current_motion_->GetNumBodies() < 1) {
+            throw std::runtime_error("ZMQ/planner reference motion is unavailable");
+          }
+          reference_cursor = static_cast<std::size_t>(std::max(current_frame_, 0));
+          external_motion_snapshot_ = current_motion_;
+          external_motion_frame_snapshot_ = current_frame_;
+          saved_frame_for_observation_window_ = 46;
+          for (std::size_t future = 0;
+               future < external_ref_tracking::kFutureFrames; ++future) {
+            const std::size_t source_frame = std::min(
+                reference_cursor + static_cast<std::size_t>(
+                    external_ref_tracking::kFutureOffsets[future]),
+                static_cast<std::size_t>(current_motion_->timesteps - 1));
+            const auto* q_isaac = current_motion_->JointPositions(source_frame);
+            const auto* dq_isaac = current_motion_->JointVelocities(source_frame);
+            for (int hardware_index = 0; hardware_index < G1_NUM_MOTOR;
+                 ++hardware_index) {
+              // This is an input transport conversion only. Policy output is
+              // still direct hardware order and never uses a SONIC reorder.
+              const int isaac_index = isaaclab_to_mujoco[hardware_index];
+              window[future].joint_pos[hardware_index] = q_isaac[isaac_index];
+              window[future].joint_vel[hardware_index] = dq_isaac[isaac_index];
+            }
+            const auto& root = current_motion_->BodyQuaternions(source_frame)[0];
+            for (int component = 0; component < 4; ++component) {
+              window[future].root_quat_wxyz[component] = root[component];
+            }
+          }
+          observation = external_obs_builder_->Build(window, state.base_quat_wxyz);
+        } else {
+          observation = external_obs_builder_->Build(
+              *external_reference_, external_frame_, state.base_quat_wxyz);
+        }
         auto& policy_input = policy_engine_->GetInputBuffer();
         std::copy(observation.begin(), observation.end(), policy_input.begin());
         if (!policy_engine_->Infer()) return false;
@@ -3312,7 +3401,7 @@ class G1Deploy {
         if (external_log_file_ && external_log_file_->good()) {
           const auto action_range = std::minmax_element(raw_action.begin(), raw_action.end());
           const auto target_range = std::minmax_element(target.begin(), target.end());
-          (*external_log_file_) << external_ticks_ << ',' << external_frame_ << ','
+          (*external_log_file_) << external_ticks_ << ',' << reference_cursor << ','
               << *action_range.first << ',' << *action_range.second << ','
               << *target_range.first << ',' << *target_range.second << ','
               << max_measured_error << ',' << max_target_step;
@@ -3327,14 +3416,17 @@ class G1Deploy {
           const auto action_range = std::minmax_element(raw_action.begin(), raw_action.end());
           const auto target_range = std::minmax_element(target.begin(), target.end());
           std::cout << "[ExternalRef] tick=" << external_ticks_
-                    << " frame=" << external_frame_ << " obs_shape=[1,1570] obs=["
+                    << " frame=" << reference_cursor << " obs_shape=[1,1570] obs=["
                     << *obs_range.first << ',' << *obs_range.second << "] action=["
                     << *action_range.first << ',' << *action_range.second << "] q_target=["
                     << *target_range.first << ',' << *target_range.second << "]" << std::endl;
         }
         ++external_ticks_;
-        external_frame_ = std::min(external_frame_ + 1, external_reference_->Size() - 1);
-        if (external_ticks_ >= external_max_ticks_) {
+        if (!external_ref_stream_source_) {
+          external_frame_ = std::min(external_frame_ + 1,
+                                     external_reference_->Size() - 1);
+        }
+        if (external_max_ticks_ > 0 && external_ticks_ >= external_max_ticks_) {
           std::cout << "[ExternalRef] protected max tick count reached; stopping" << std::endl;
           operator_state.stop = true;
         }
@@ -4083,13 +4175,43 @@ class G1Deploy {
             return;
           }
 
-          // The external-reference backend is deliberately a separate control
-          // path: direct hardware observations, its own 1570-D builder, direct
-          // action order, and JSON control parameters. No SONIC observation,
-          // encoder, planner, cursor, or output reorder code runs below.
+          // The external-reference backend has its own 1570-D observation,
+          // direct action order, and JSON control parameters. In stream mode
+          // it deliberately retains the established SONIC planner/merger/
+          // cursor transport used by the Terminal-2 K/I/P replay workflow.
           if (external_ref_enabled_) {
             if (!RunExternalTrackingTick()) {
               operator_state.stop = true;
+              return;
+            }
+            if (external_ref_stream_source_) {
+              int frame_copy = external_motion_frame_snapshot_;
+              int encoder_mode_copy = initial_encoder_mode_;
+              bool play_copy = false;
+              std::shared_ptr<const MotionSequence> motion_copy =
+                  external_motion_snapshot_;
+              play_copy = operator_state.play;
+              if (motion_copy) encoder_mode_copy = motion_copy->GetEncodeMode();
+              if (state_logger_) {
+                const std::span<double> no_tokens;
+                state_logger_->LogPostState(
+                    no_tokens, encoder_mode_copy,
+                    motion_copy ? motion_copy->name : "", play_copy);
+              }
+              const auto stream_diagnostics = input_interface_->GetStreamDiagnostics();
+              for (auto& output_interface : output_interfaces_) {
+                if (output_interface) {
+                  output_interface->publish(
+                      vr_3point_position_buffer_, vr_3point_orientation_buffer_,
+                      vr_3point_compliance_buffer_, left_hand_joint_buffer_,
+                      right_hand_joint_buffer_, init_ref_data_root_rot_array_,
+                      heading_state_buffer_, motion_copy, frame_copy,
+                      stream_diagnostics);
+                }
+              }
+              if (!CurrentFrameAdvancement()) {
+                operator_state.stop = true;
+              }
             }
             return;
           }
@@ -4381,11 +4503,12 @@ int main(int argc, char const* argv[]) {
     std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "  --policy-type <sonic|external_ref_tracking>: explicit backend (default: sonic)" << std::endl;
+    std::cout << "  --external-reference-source <onnx|stream>: reference provider (default: onnx)" << std::endl;
     std::cout << "  --external-reference <path>: external ep100 reference ONNX" << std::endl;
     std::cout << "  --external-control <path>: metadata-derived control JSON" << std::endl;
     std::cout << "  --external-init-state <path>: initial-state NPZ" << std::endl;
     std::cout << "  --external-reference-frames <n>: declared reference length (default: 941)" << std::endl;
-    std::cout << "  --external-max-ticks <n>: protected auto-stop limit (default: 250)" << std::endl;
+    std::cout << "  --external-max-ticks <n>: auto-stop limit; 0 holds stream terminal (default: 250)" << std::endl;
     std::cout << "  --external-gain-scale <0..1>: PD pilot scale (default: 0.25)" << std::endl;
     std::cout << "  --external-max-first-error <rad>: first target guard; 0 disables (default: 0.5)" << std::endl;
     std::cout << "  --external-max-target-step <rad>: per-tick guard; 0 disables (default: 0.5)" << std::endl;
@@ -4436,6 +4559,7 @@ int main(int argc, char const* argv[]) {
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
   bool externalRefEnabled = false;
+  bool externalRefStreamSource = false;
   std::string externalReferencePath;
   std::string externalControlPath;
   std::string externalInitPath;
@@ -4456,6 +4580,11 @@ int main(int argc, char const* argv[]) {
       if (value == "external_ref_tracking") externalRefEnabled = true;
       else if (value == "sonic") externalRefEnabled = false;
       else throw std::runtime_error("--policy-type must be sonic or external_ref_tracking");
+    } else if (argument == "--external-reference-source") {
+      const std::string value = require_value(argument);
+      if (value == "stream") externalRefStreamSource = true;
+      else if (value == "onnx") externalRefStreamSource = false;
+      else throw std::runtime_error("--external-reference-source must be onnx or stream");
     } else if (argument == "--external-reference") {
       externalReferencePath = require_value(argument);
     } else if (argument == "--external-control") {
@@ -4708,12 +4837,13 @@ int main(int argc, char const* argv[]) {
   }
 
   if (externalRefEnabled) {
-    if (externalReferencePath.empty() || externalControlPath.empty() ||
-        externalInitPath.empty()) {
+    if ((!externalRefStreamSource && externalReferencePath.empty()) ||
+        externalControlPath.empty() || externalInitPath.empty()) {
       throw std::runtime_error(
-          "external_ref_tracking requires --external-reference, --external-control, and --external-init-state");
+          "external_ref_tracking requires control/init and an ONNX reference unless source=stream");
     }
-    if (!obsConfigPath.empty() || !encoderFile.empty() || !plannerFile.empty()) {
+    if (!obsConfigPath.empty() || !encoderFile.empty() ||
+        (!externalRefStreamSource && !plannerFile.empty())) {
       throw std::runtime_error(
           "external_ref_tracking must not receive SONIC obs/encoder/planner flags");
     }
@@ -4750,6 +4880,7 @@ int main(int argc, char const* argv[]) {
     initial_compliance,
     initial_max_close_ratio,
     externalRefEnabled,
+    externalRefStreamSource,
     externalReferencePath,
     externalControlPath,
     externalInitPath,

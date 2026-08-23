@@ -1,0 +1,23 @@
+{
+  "reference_onnx": "/home/chuye/g1_general_tracking_external_ref_package_20260822/reference/ep100_pick100_goldprefix_fixed62_21_relativeyaw_motionlib_ref.onnx",
+  "terminal2_reference_npz": "/home/chuye/GR00T-WholeBodyControl/deploy_packages/g1_pick147_ep100_146_mixedbackstep_native_release_replay_bundle_20260816/replay_npz/episode_000100_pick100_goldprefix_fixed62_21_relativeyaw.npz",
+  "terminal2_reference_npz_sha256": "196d1b8b98af7b3f142275ea6435c94ac7346fc7d3cae75836596d470ad2add3",
+  "frames": 941,
+  "transport_joint_order": "isaaclab_29d_protocol_v1",
+  "policy_reference_joint_order": "mujoco_hardware_order_from_metadata",
+  "input_transport_conversion": "hardware[i] = streamed_isaaclab[isaaclab_to_mujoco[i]]",
+  "policy_output_conversion": "none_direct_hardware_order",
+  "max_abs_difference_after_input_conversion": {
+    "joint_pos_rad": 2.3841858e-07,
+    "joint_vel_rad_s": 0.0,
+    "root_quaternion_wxyz": 1.1920929e-07
+  },
+  "terminal2_protocol_dry_run": {
+    "status": "passed",
+    "first_packet_global_range": [0, 986],
+    "terminal_local_frame": 940,
+    "lookahead_frames": 46,
+    "reference_arrays_transmitted_unchanged": true,
+    "terminal_future_all_hold": true
+  }
+}

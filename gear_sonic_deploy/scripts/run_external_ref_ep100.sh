@@ -40,7 +40,7 @@ if [[ "$MODE" == "sim" ]]; then
   NETWORK_INTERFACE="lo"
   CRC_FLAG="--disable-crc-check"
   GAIN_SCALE="${EXTERNAL_REF_GAIN_SCALE:-1.0}"
-  MAX_TICKS="${EXTERNAL_REF_MAX_TICKS:-941}"
+  MAX_TICKS="${EXTERNAL_REF_MAX_TICKS:-0}"
 else
   NETWORK_INTERFACE="${EXTERNAL_REF_REAL_INTERFACE:-}"
   if [[ -z "$NETWORK_INTERFACE" ]]; then
@@ -52,27 +52,39 @@ else
   fi
   CRC_FLAG=""
   GAIN_SCALE="${EXTERNAL_REF_GAIN_SCALE:-1.0}"
-  MAX_TICKS="${EXTERNAL_REF_MAX_TICKS:-941}"
-  echo "REAL ROBOT external-reference replay: interface=$NETWORK_INTERFACE gain=$GAIN_SCALE max_ticks=$MAX_TICKS"
+  MAX_TICKS="${EXTERNAL_REF_MAX_TICKS:-0}"
+  echo "REAL ROBOT external-reference K/I/P replay: interface=$NETWORK_INTERFACE gain=$GAIN_SCALE"
 fi
 
 cmake -S . -B build_external_ref -DCMAKE_BUILD_TYPE=Release
 cmake --build build_external_ref --target g1_deploy_onnx_ref -j"$(nproc)"
 
+PLANNER="${EXTERNAL_REF_PLANNER:-/home/chuye/GR00T-WholeBodyControl/gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx}"
+if [[ ! -f "$PLANNER" ]]; then
+  echo "Missing SONIC planner required by the K/I/P positioning flow: $PLANNER" >&2
+  exit 1
+fi
+
 arguments=(
-  "$NETWORK_INTERFACE" "$POLICY" "$PACKAGE_DIR/reference"
+  "$NETWORK_INTERFACE" "$POLICY" "$REPO_DIR/reference/example"
   --policy-type external_ref_tracking
-  --external-reference "$REFERENCE"
+  --external-reference-source stream
   --external-control "$CONTROL"
   --external-init-state "$INIT_STATE"
-  --external-reference-frames 941
   --external-max-ticks "$MAX_TICKS"
   --external-gain-scale "$GAIN_SCALE"
   --external-max-first-error "${EXTERNAL_REF_MAX_FIRST_ERROR:-0}"
   --external-max-target-step "${EXTERNAL_REF_MAX_TARGET_STEP:-0}"
   --external-log "$LOG_DIR/${MODE}_control.csv"
-  --input-type keyboard
+  --planner-file "$PLANNER"
+  --input-type zmq_manager
   --output-type zmq
+  --zmq-host localhost
 )
 if [[ -n "$CRC_FLAG" ]]; then arguments+=("$CRC_FLAG"); fi
+if [[ "${EXTERNAL_REF_PRINT_COMMAND:-0}" == "1" ]]; then
+  printf '%q ' target/release/g1_deploy_onnx_ref "${arguments[@]}"
+  printf '\n'
+  exit 0
+fi
 exec target/release/g1_deploy_onnx_ref "${arguments[@]}"
