@@ -2215,7 +2215,7 @@ class G1Deploy {
         if (external_reference_path.empty() || external_control_path.empty() ||
             external_init_path.empty() || external_max_ticks == 0 ||
             external_gain_scale <= 0.0f || external_gain_scale > 1.0f ||
-            external_max_first_error <= 0.0f || external_max_target_step <= 0.0f) {
+            external_max_first_error < 0.0f || external_max_target_step < 0.0f) {
           throw std::runtime_error("invalid external-reference safety/config arguments");
         }
         external_control_ = external_ref_tracking::ControlConfig::Load(external_control_path);
@@ -3284,11 +3284,13 @@ class G1Deploy {
           max_target_step = std::max(max_target_step,
                                      std::abs(target[i] - external_previous_target_[i]));
         }
-        if (external_first_command_ && max_measured_error > external_max_first_error_) {
+        if (external_first_command_ && external_max_first_error_ > 0.0f &&
+            max_measured_error > external_max_first_error_) {
           throw std::runtime_error("first q_target jump exceeds protection limit: " +
                                    std::to_string(max_measured_error));
         }
-        if (!external_first_command_ && max_target_step > external_max_target_step_) {
+        if (!external_first_command_ && external_max_target_step_ > 0.0f &&
+            max_target_step > external_max_target_step_) {
           throw std::runtime_error("q_target step exceeds protection limit: " +
                                    std::to_string(max_target_step));
         }
@@ -4385,8 +4387,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --external-reference-frames <n>: declared reference length (default: 941)" << std::endl;
     std::cout << "  --external-max-ticks <n>: protected auto-stop limit (default: 250)" << std::endl;
     std::cout << "  --external-gain-scale <0..1>: PD pilot scale (default: 0.25)" << std::endl;
-    std::cout << "  --external-max-first-error <rad>: first target guard (default: 0.5)" << std::endl;
-    std::cout << "  --external-max-target-step <rad>: per-tick guard (default: 0.5)" << std::endl;
+    std::cout << "  --external-max-first-error <rad>: first target guard; 0 disables (default: 0.5)" << std::endl;
+    std::cout << "  --external-max-target-step <rad>: per-tick guard; 0 disables (default: 0.5)" << std::endl;
     std::cout << "  --external-log <path>: external action/target safety CSV" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;

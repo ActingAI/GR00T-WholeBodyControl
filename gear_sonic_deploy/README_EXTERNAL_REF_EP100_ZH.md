@@ -57,7 +57,7 @@ verification/ep100_standard_941_video/mujoco_replay.mp4
 
 sim 默认完整 941 policy tick、JSON 原始 PD；可通过 `EXTERNAL_REF_GAIN_SCALE` 和 `EXTERNAL_REF_MAX_TICKS` 覆盖。
 
-## 真机保护入口
+## 真机完整 replay 入口
 
 真机前必须先通过 dry-run 和 MuJoCo。准备好急停后：
 
@@ -66,9 +66,9 @@ EXTERNAL_REF_REAL_INTERFACE=enp5s0 \
 ./scripts/run_external_ref_ep100.sh real
 ```
 
-脚本要求手工输入 `RUN_EP100_EXTERNAL_REF`。默认只运行 250 tick，PD 为 JSON 参数的 0.25 倍，首条 target 相对实测关节的最大误差限制为 0.5 rad，逐 tick target 最大变化限制为 0.5 rad；非有限值、关节速度超限或 target guard 触发会切 damping 并停止。真机模式拒绝把 gain scale 调到 0.25 以上。
+真机默认按完整 ep100 replay 运行 941 policy tick，使用 JSON 中原始 kp/kd（gain scale 1.0），首条 target 和逐 tick target guard 均关闭，与完整 motion replay 配置一致。非有限值、LowState/IMU 丢失、关节速度异常和急停仍会停止控制；这些基础故障保护不会被关闭。
 
-这只是准备好的低风险入口；本次代码验证不包含实际真机启动。
+本次代码验证不包含实际真机启动。
 
 ## 回退
 

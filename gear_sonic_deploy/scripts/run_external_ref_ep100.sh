@@ -51,18 +51,9 @@ else
     exit 1
   fi
   CRC_FLAG=""
-  GAIN_SCALE="${EXTERNAL_REF_GAIN_SCALE:-0.25}"
-  MAX_TICKS="${EXTERNAL_REF_MAX_TICKS:-250}"
-  if ! awk -v value="$GAIN_SCALE" 'BEGIN { exit !(value > 0 && value <= 0.25) }'; then
-    echo "Real pilot requires 0 < EXTERNAL_REF_GAIN_SCALE <= 0.25." >&2
-    exit 1
-  fi
-  echo "REAL ROBOT external-reference pilot: interface=$NETWORK_INTERFACE gain=$GAIN_SCALE max_ticks=$MAX_TICKS"
-  read -r -p "Type RUN_EP100_EXTERNAL_REF to continue: " confirmation
-  if [[ "$confirmation" != "RUN_EP100_EXTERNAL_REF" ]]; then
-    echo "Cancelled."
-    exit 0
-  fi
+  GAIN_SCALE="${EXTERNAL_REF_GAIN_SCALE:-1.0}"
+  MAX_TICKS="${EXTERNAL_REF_MAX_TICKS:-941}"
+  echo "REAL ROBOT external-reference replay: interface=$NETWORK_INTERFACE gain=$GAIN_SCALE max_ticks=$MAX_TICKS"
 fi
 
 cmake -S . -B build_external_ref -DCMAKE_BUILD_TYPE=Release
@@ -77,8 +68,8 @@ arguments=(
   --external-reference-frames 941
   --external-max-ticks "$MAX_TICKS"
   --external-gain-scale "$GAIN_SCALE"
-  --external-max-first-error "${EXTERNAL_REF_MAX_FIRST_ERROR:-0.5}"
-  --external-max-target-step "${EXTERNAL_REF_MAX_TARGET_STEP:-0.5}"
+  --external-max-first-error "${EXTERNAL_REF_MAX_FIRST_ERROR:-0}"
+  --external-max-target-step "${EXTERNAL_REF_MAX_TARGET_STEP:-0}"
   --external-log "$LOG_DIR/${MODE}_control.csv"
   --input-type keyboard
   --output-type zmq
