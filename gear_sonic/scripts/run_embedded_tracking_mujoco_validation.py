@@ -12,9 +12,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
+
+# MuJoCo must select its headless backend before it is imported.
+if "--video" in sys.argv and "--onscreen" not in sys.argv:
+    os.environ.setdefault("MUJOCO_GL", "egl")
 
 import mujoco
 import numpy as np
@@ -35,6 +41,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--interface", default="sim")
     parser.add_argument("--onscreen", action="store_true")
+    parser.add_argument("--video", type=Path)
+    parser.add_argument("--video-fps", type=float, default=30.0)
+    parser.add_argument("--video-width", type=int, default=640)
+    parser.add_argument("--video-height", type=int, default=480)
     parser.add_argument("--command-timeout-s", type=float, default=30.0)
     parser.add_argument("--policy-start-timeout-s", type=float, default=45.0)
     parser.add_argument(
@@ -220,12 +230,17 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "max_body_joint_speed_rad_s",
         "max_command_step_rad",
         "max_torque_saturation_fraction",
+        "video_fps",
     ):
         _finite_nonnegative(name, float(getattr(args, name)))
     if args.duration_after_release_s == 0.0:
         raise ValueError("duration_after_release_s must be greater than zero")
     if args.max_torque_saturation_fraction > 1.0:
         raise ValueError("max_torque_saturation_fraction must be in [0, 1]")
+    if args.video is not None and args.video_fps == 0.0:
+        raise ValueError("video_fps must be greater than zero")
+    if args.video_width <= 0 or args.video_height <= 0:
+        raise ValueError("video dimensions must be positive")
 
     init_state, control = _load_inputs(args.init_state, args.tracking_control)
     config = SimLoopConfig(
@@ -262,6 +277,9 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "policy_start_command_step_rad": args.policy_start_command_step_rad,
         },
     }
+    renderer = None
+    video_writer = None
+    video_frames = 0
 
     try:
         mapping = _initialize_and_validate_model(sim, init_state, control)
@@ -277,6 +295,31 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         torque_limits = np.asarray(env.torque_limit[body_actuator_ids], dtype=np.float64)
         expected_kp = np.asarray(control["joint_stiffness"], dtype=np.float64)
         expected_kd = np.asarray(control["joint_damping"], dtype=np.float64)
+
+        video_camera = None
+        if args.video is not None:
+            import cv2
+
+            args.video.parent.mkdir(parents=True, exist_ok=True)
+            renderer = mujoco.Renderer(
+                model, height=args.video_height, width=args.video_width
+            )
+            video_camera = mujoco.MjvCamera()
+            mujoco.mjv_defaultCamera(video_camera)
+            video_camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            video_camera.trackbodyid = model.body("pelvis").id
+            video_camera.distance = 2.8
+            video_camera.azimuth = 135.0
+            video_camera.elevation = -18.0
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            video_writer = cv2.VideoWriter(
+                str(args.video),
+                fourcc,
+                args.video_fps,
+                (args.video_width, args.video_height),
+            )
+            if not video_writer.isOpened():
+                raise RuntimeError(f"failed to open video writer: {args.video}")
 
         first_command_sim_time: float | None = None
         policy_start_sim_time: float | None = None
@@ -303,11 +346,38 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         max_actuator_force = 0.0
         max_torque_limit_ratio = 0.0
         command_deadline = time.monotonic() + args.command_timeout_s
+        next_video_sim_time: float | None = None
 
         print("[MuJoCoValidation] Waiting for the C++ runtime on Unitree DDS rt/lowcmd ...")
         while True:
             step_wall_start = time.monotonic()
             pre_step_height = float(data.qpos[2])
+            if video_writer is not None and first_command_sim_time is not None:
+                if next_video_sim_time is None:
+                    next_video_sim_time = float(data.time)
+                if float(data.time) >= next_video_sim_time:
+                    import cv2
+
+                    renderer.update_scene(data, camera=video_camera)
+                    frame = renderer.render()
+                    phase = (
+                        "FREE BASE"
+                        if release_sim_time is not None
+                        else "SUPPORTED / INITIALIZING"
+                    )
+                    cv2.putText(
+                        frame,
+                        f"t={float(data.time) - first_command_sim_time:5.2f}s  {phase}",
+                        (24, 42),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (255, 80, 30),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    video_frames += 1
+                    next_video_sim_time += 1.0 / args.video_fps
             env.sim_step()
             q_command = _low_command_snapshot(bridge, len(body_joint_ids))
 
@@ -432,6 +502,10 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     except KeyboardInterrupt:
         report["failure_reasons"].append("validation interrupted by user")
     finally:
+        if video_writer is not None:
+            video_writer.release()
+        if renderer is not None:
+            renderer.close()
         sim.close()
 
     if "mapping" not in report:
@@ -449,6 +523,14 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "released_samples": samples,
         "sim_dt_s": float(wbc_config["SIMULATE_DT"]),
     }
+    if args.video is not None:
+        report["video"] = {
+            "path": str(args.video.resolve()),
+            "fps": args.video_fps,
+            "width": args.video_width,
+            "height": args.video_height,
+            "frames": video_frames,
+        }
     report["metrics"] = {
         "finite": finite,
         "fall_count": fall_count,

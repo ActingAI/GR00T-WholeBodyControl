@@ -44,7 +44,7 @@ Terminal A starts the instrumented robot replacement from the package common
 initial state. It validates all 29 joint/qpos/qvel/actuator mappings before
 publishing any state, holds the elastic support through C++ initialization,
 waits until it detects the first policy command, then releases the support and
-writes a JSON report:
+writes a JSON report plus an annotated MuJoCo MP4:
 
 ```bash
 source .venv_sim/bin/activate
@@ -56,6 +56,7 @@ python gear_sonic/scripts/run_embedded_tracking_mujoco_validation.py \
   --init-state "$PACKAGE_DIR/init/common_initial_state.npz" \
   --tracking-control "$PACKAGE_DIR/policy/flip360_general_tracking_ep100_pick100_fixed62_21_relativeyaw.control.json" \
   --output "$REPORT_DIR/report.json" \
+  --video "$REPORT_DIR/fall.mp4" \
   --command-timeout-s 60 \
   --policy-start-timeout-s 45 \
   --release-after-command-s 4 \
