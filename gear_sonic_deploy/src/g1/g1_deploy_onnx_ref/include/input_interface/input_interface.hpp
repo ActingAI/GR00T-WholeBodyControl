@@ -31,6 +31,7 @@
 
 #include <unistd.h>
 #include <atomic>
+#include <cstdint>
 #include <queue>
 #include <memory>
 #include <optional>
@@ -55,6 +56,7 @@ public:
       int window_start = 0;
       int window_end = -1;
       int frame_step = 1;
+      uint64_t accepted_packet_sequence = 0;
     };
 
     /// Identifies the physical / logical source of this input interface.

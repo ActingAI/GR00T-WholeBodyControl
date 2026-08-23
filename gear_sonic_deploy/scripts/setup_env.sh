@@ -117,43 +117,62 @@ if [ -n "$onnxruntime_DIR" ]; then
     CMAKE_PATHS="$ONNX_BASE_PATH:$CMAKE_PATHS"
 fi
 
+strip_ros_paths() {
+    echo "$1" | tr ':' '\n' | grep -vE '^/opt/ros/|^/usr/local/ros/|/ros2_ws/install' | paste -sd ':' -
+}
+
+# ROS/ROS2 is optional for the deploy binary.  The real-robot/data-collection path uses
+# ZMQ, and auto-sourcing ROS can poison CMake with mixed ROS1/ROS2 include paths.
+# Keep ROS disabled unless the caller explicitly requests it with HAS_ROS2=1.
+if [ "${HAS_ROS2:-0}" != "1" ]; then
+    export CMAKE_PREFIX_PATH="$(strip_ros_paths "$CMAKE_PREFIX_PATH")"
+    export LD_LIBRARY_PATH="$(strip_ros_paths "$LD_LIBRARY_PATH")"
+    export PYTHONPATH="$(strip_ros_paths "$PYTHONPATH")"
+    unset ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION ROS_PACKAGE_PATH ROS_ROOT ROS_ETC_DIR ROS_MASTER_URI
+    unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY
+    export HAS_ROS2=0
+fi
+
 export CMAKE_PREFIX_PATH="$CMAKE_PATHS:$CMAKE_PREFIX_PATH"
 export OPENSSL_ROOT_DIR="/usr"
 
 # ROS2 Environment Setup - dynamically find ROS2 installation
 ROS2_FOUND=false
 
-# Common ROS2 distributions in order of preference (newest first)
-ROS2_DISTROS=("jazzy" "iron" "humble" "galactic" "foxy" "eloquent" "dashing" "crystal")
-ROS2_INSTALL_PATHS=("/opt/ros" "/usr/local/ros" "$HOME/ros2_ws/install")
+if [ "${HAS_ROS2:-0}" = "1" ]; then
+    # Common ROS2 distributions in order of preference (newest first)
+    ROS2_DISTROS=("jazzy" "iron" "humble" "galactic" "foxy" "eloquent" "dashing" "crystal")
+    ROS2_INSTALL_PATHS=("/opt/ros" "/usr/local/ros" "$HOME/ros2_ws/install")
 
-for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
-    if [ "$ROS2_FOUND" = true ]; then
-        break
-    fi
-    
-    for distro in "${ROS2_DISTROS[@]}"; do
-        ros2_setup_file="$install_path/$distro/setup.bash"
-        if [ -f "$ros2_setup_file" ]; then
-            source "$ros2_setup_file"
-            export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-            # Remove problematic system library path that conflicts with system GLIBC
-            export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v "$SYSTEM_LIB_DIR" | tr '\n' ':' | sed 's/:$//')
-            echo "✅ ROS2 $distro found at $install_path/$distro - system manages all ROS2 dependencies"
-            export HAS_ROS2=1
-            export ROS_LOCALHOST_ONLY=1
-            ROS2_FOUND=true
+    for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
+        if [ "$ROS2_FOUND" = true ]; then
             break
         fi
-    done
-done
 
-if [ "$ROS2_FOUND" = false ]; then
-    echo "⚠️  ROS2 not found in common locations:"
-    printf "   %s/<distro>\n" "${ROS2_INSTALL_PATHS[@]}"
-    echo "   Install ROS2 system-wide for ROS2InputHandler support"
-    echo "   Building will continue without ROS2InputHandler"
-    export HAS_ROS2=0
+        for distro in "${ROS2_DISTROS[@]}"; do
+            ros2_setup_file="$install_path/$distro/setup.bash"
+            if [ -f "$ros2_setup_file" ]; then
+                source "$ros2_setup_file"
+                export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+                # Remove problematic system library path that conflicts with system GLIBC
+                export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v "$SYSTEM_LIB_DIR" | tr '\n' ':' | sed 's/:$//')
+                echo "✅ ROS2 $distro found at $install_path/$distro - system manages all ROS2 dependencies"
+                export HAS_ROS2=1
+                export ROS_LOCALHOST_ONLY=1
+                ROS2_FOUND=true
+                break
+            fi
+        done
+    done
+
+    if [ "$ROS2_FOUND" = false ]; then
+        echo "⚠️  HAS_ROS2=1 was requested, but ROS2 was not found in common locations:"
+        printf "   %s/<distro>\n" "${ROS2_INSTALL_PATHS[@]}"
+        echo "   Building will continue without ROS2InputHandler"
+        export HAS_ROS2=0
+    fi
+else
+    echo "ℹ️  ROS2 support disabled for deploy build (set HAS_ROS2=1 to enable ROS2InputHandler)"
 fi
 
 # Set up production FastRTPS profile
@@ -344,4 +363,3 @@ echo ""
 if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
 fi
-

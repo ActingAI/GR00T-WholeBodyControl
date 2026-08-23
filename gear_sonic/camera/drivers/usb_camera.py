@@ -4,6 +4,9 @@ No hardware SDK needed — works with any UVC-compatible camera visible as
 ``/dev/video*``.  Only requires ``opencv-python``.
 """
 
+from __future__ import annotations
+
+from pathlib import Path
 import time
 from typing import Any
 
@@ -24,7 +27,7 @@ class USBCameraConfig:
 
     image_dim: tuple = (640, 480)
     fps: int = 30
-    device_index: int = 0
+    device_index: int | str = 0
 
 
 class USBCameraSensor(Sensor):
@@ -34,21 +37,26 @@ class USBCameraSensor(Sensor):
         self,
         config: USBCameraConfig = USBCameraConfig(),
         mount_position: str = CameraMountPosition.EGO_VIEW.value,
-        device_index: int | None = None,
+        device_index: int | str | None = None,
     ):
         self.config = config
         self.mount_position = mount_position
 
         idx = device_index if device_index is not None else config.device_index
+        if isinstance(idx, str) and idx.startswith("/dev/"):
+            idx = str(Path(idx).resolve())
 
-        self.cap = cv2.VideoCapture(idx)
+        self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             raise RuntimeError(f"Failed to open USB camera at index {idx}")
 
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.image_dim[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.image_dim[1])
         self.cap.set(cv2.CAP_PROP_FPS, config.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # On the ELP global-shutter UVC camera, a single V4L2 buffer halves
+        # throughput to ~15 Hz. Two buffers keeps latency low while preserving 30 Hz.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
         print(f"[{mount_position}] Warming up USB camera...")
         for _ in range(10):
@@ -68,6 +76,10 @@ class USBCameraSensor(Sensor):
         if not ret or frame is None:
             print(f"[{self.mount_position}] USB camera read failed: ret={ret}")
             return None
+
+        target_width, target_height = self.config.image_dim
+        if frame.shape[1] != target_width or frame.shape[0] != target_height:
+            frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return {

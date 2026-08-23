@@ -290,7 +290,7 @@ private:
         // Visualisation fields: output_data_map_.size() (typically 11)
         int num_state_fields = has_heading_state ? 22 : 20;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
-        constexpr int num_stream_fields = 8;
+        constexpr int num_stream_fields = 9;
         pk.pack_map(num_state_fields + num_viz_fields + num_stream_fields);
 
         const int motion_end = current_motion && current_motion->timesteps > 0
@@ -313,6 +313,7 @@ private:
         pk.pack("stream_encoder_clamp_count"); pk.pack(clamp_count);
         pk.pack("stream_frame_step"); pk.pack(stream_diagnostics.frame_step);
         pk.pack("stream_active"); pk.pack(stream_diagnostics.active);
+        pk.pack("stream_packet_sequence"); pk.pack(stream_diagnostics.accepted_packet_sequence);
 
         // ---- State-logger fields ----
 

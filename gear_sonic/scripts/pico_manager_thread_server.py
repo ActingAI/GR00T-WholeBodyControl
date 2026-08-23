@@ -1739,6 +1739,13 @@ class PlannerStreamer:
         """Called when entering planner mode. Resets state for fresh start."""
         self.yaw_accumulator.reset()
 
+    def _pace(self):
+        now = time.time()
+        sleep_t = self.dt - (now - self.last_send)
+        if sleep_t > 0:
+            time.sleep(sleep_t)
+        self.last_send = time.time()
+
     def save_upper_body_position_target(self):
         """Poll feedback and save upper body position target."""
         self.feedback_reader.poll_feedback()
@@ -1769,6 +1776,7 @@ class PlannerStreamer:
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
             xrt_timestamp = xrt.get_time_stamp_ns()
             if xrt_timestamp == self.last_xrt_timestamp:
+                self._pace()
                 return
             self.last_xrt_timestamp = xrt_timestamp
 
@@ -1881,12 +1889,7 @@ class PlannerStreamer:
             traceback.print_exc()
             raise
 
-        # pacing
-        now = time.time()
-        sleep_t = self.dt - (now - self.last_send)
-        if sleep_t > 0:
-            time.sleep(sleep_t)
-        self.last_send = time.time()
+        self._pace()
 
 
 def run_pico_manager(
@@ -2002,6 +2005,8 @@ def run_pico_manager(
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
+    manager_state_period = 1.0 / 50.0
+    last_manager_state_send = 0.0
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
@@ -2155,16 +2160,19 @@ def run_pico_manager(
             toggle_da = toggle_da_tmp and not prev_toggle_da
             prev_toggle_dc = toggle_dc_tmp
             prev_toggle_da = toggle_da_tmp
-            socket.send(
-                pack_pose_message(
-                    {
-                        "stream_mode": np.array([current_mode.value], dtype=np.int32),
-                        "toggle_data_collection": np.array([toggle_dc], dtype=bool),
-                        "toggle_data_abort": np.array([toggle_da], dtype=bool),
-                    },
-                    topic="manager_state",
+            now = time.time()
+            if toggle_dc or toggle_da or now - last_manager_state_send >= manager_state_period:
+                socket.send(
+                    pack_pose_message(
+                        {
+                            "stream_mode": np.array([current_mode.value], dtype=np.int32),
+                            "toggle_data_collection": np.array([toggle_dc], dtype=bool),
+                            "toggle_data_abort": np.array([toggle_da], dtype=bool),
+                        },
+                        topic="manager_state",
+                    )
                 )
-            )
+                last_manager_state_send = now
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed

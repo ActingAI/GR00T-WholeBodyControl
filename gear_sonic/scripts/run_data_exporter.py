@@ -74,6 +74,11 @@ class SonicDataExporterConfig:
     data_collection_frequency: int = 50
     """Data collection frequency (Hz)."""
 
+    max_camera_age_s: float = 0.5
+    """Maximum age for required camera frames before pausing recording."""
+
+    max_genrobot_gripper_age_s: float = 0.5
+    """Maximum age for GENROBOT gripper state before pausing recording."""
 
     # Camera
     camera_host: str = "localhost"
@@ -286,6 +291,8 @@ class GrootDataCollector:
         record_genrobot_gripper: bool = False,
         genrobot_gripper_state_host: str = "",
         genrobot_gripper_state_port: int = 5569,
+        max_camera_age_s: float = 0.5,
+        max_genrobot_gripper_age_s: float = 0.5,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -294,6 +301,8 @@ class GrootDataCollector:
         self.robot_model = robot_model
         self.record_wrist_cameras = record_wrist_cameras
         self.record_genrobot_gripper = record_genrobot_gripper
+        self.max_camera_age_s = max_camera_age_s
+        self.max_genrobot_gripper_age_s = max_genrobot_gripper_age_s
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -429,6 +438,31 @@ class GrootDataCollector:
                 if image_key not in images:
                     missing.append(image_key)
         return missing
+
+    def _stale_required_images(self) -> list[str]:
+        if self.latest_image_msg is None:
+            return []
+        receive_timestamps = self.latest_image_msg.get("receive_timestamps", {})
+        now = time.time()
+        stale = []
+        for feature_name, feature_info in self.data_exporter.features.items():
+            if feature_info.get("dtype") in ["image", "video"]:
+                image_key = feature_name.split(".")[-1]
+                receive_ts = float(receive_timestamps.get(image_key, 0.0))
+                if receive_ts <= 0.0 or now - receive_ts > self.max_camera_age_s:
+                    stale.append(image_key)
+        return stale
+
+    def _genrobot_gripper_stale(self) -> bool:
+        if not self.record_genrobot_gripper or self.latest_genrobot_gripper_msg is None:
+            return False
+        receive_ts = float(
+            self.latest_genrobot_gripper_msg.get(
+                "exporter_receive_timestamp",
+                self.latest_genrobot_gripper_msg.get("receive_timestamp", 0.0),
+            )
+        )
+        return receive_ts <= 0.0 or time.time() - receive_ts > self.max_genrobot_gripper_age_s
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -822,6 +856,7 @@ class GrootDataCollector:
         t_start = time.monotonic()
 
         missing_images = self._missing_required_images()
+        stale_images = self._stale_required_images()
         missing_genrobot = (
             self.record_genrobot_gripper
             and (
@@ -830,18 +865,23 @@ class GrootDataCollector:
                 or self.latest_genrobot_gripper_msg.get("right_encoder") is None
             )
         )
+        stale_genrobot = self._genrobot_gripper_stale()
         if (
             self.latest_proprio_msg is None
             or self.latest_image_msg is None
             or missing_images
+            or stale_images
             or missing_genrobot
+            or stale_genrobot
         ):
             self._print_and_say(
                 f"Waiting for message. "
                 f"Avail msg: proprio {self.latest_proprio_msg is not None} | "
                 f"image {self.latest_image_msg is not None} | "
                 f"missing images {missing_images} | "
-                f"genrobot {not missing_genrobot}",
+                f"stale images {stale_images} | "
+                f"genrobot {not missing_genrobot} | "
+                f"stale genrobot {stale_genrobot}",
                 say=False,
             )
             return False
@@ -1040,7 +1080,7 @@ class GrootDataCollector:
 
         planner_msg = self.latest_planner_msg
         use_planner = False
-        if self.current_stream_mode == 5 and planner_msg is not None:
+        if self.current_stream_mode in (2, 3, 5) and planner_msg is not None:
             receive_ts = planner_msg.get("receive_timestamp")
             if receive_ts is not None:
                 age_sec = time.time() - receive_ts
@@ -1326,6 +1366,8 @@ def main(config: SonicDataExporterConfig):
             "record_genrobot_gripper": config.record_genrobot_gripper,
             "genrobot_gripper_state_host": config.genrobot_gripper_state_host,
             "genrobot_gripper_state_port": config.genrobot_gripper_state_port,
+            "max_camera_age_s": config.max_camera_age_s,
+            "max_genrobot_gripper_age_s": config.max_genrobot_gripper_age_s,
         },
     )
 
@@ -1346,6 +1388,8 @@ def main(config: SonicDataExporterConfig):
         record_genrobot_gripper=config.record_genrobot_gripper,
         genrobot_gripper_state_host=config.genrobot_gripper_state_host,
         genrobot_gripper_state_port=config.genrobot_gripper_state_port,
+        max_camera_age_s=config.max_camera_age_s,
+        max_genrobot_gripper_age_s=config.max_genrobot_gripper_age_s,
     )
     data_collector.run()
 

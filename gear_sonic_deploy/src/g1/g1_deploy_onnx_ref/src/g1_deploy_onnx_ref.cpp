@@ -3389,7 +3389,12 @@ class G1Deploy {
             std::cout << "Reset to frame 0." << std::endl;
           }
         } else {
-          if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
+          // The encoder reads the current frame plus offsets through +45.  A
+          // 90-frame packet therefore has 45 executable cursors (0..44).
+          // Freeze only when advancing would leave fewer than the required
+          // current-plus-future frames; the previous >= check stopped one
+          // frame early.
+          if (current_frame_ > current_motion_->timesteps - saved_frame_for_observation_window_) {
             current_frame_ = current_frame_ - 1;
             std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;                    
           }
@@ -3903,6 +3908,7 @@ class G1Deploy {
           int current_frame_copy;
           int current_encoder_mode_copy;
           bool current_play_copy;
+          InputInterface::StreamDiagnostics stream_diagnostics_copy;
           std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
@@ -3926,6 +3932,10 @@ class G1Deploy {
               operator_state.stop = true;
               return;
             }
+            // Snapshot stream metadata while current_frame/current_motion are
+            // protected by the same lock.  Packet commits update both under
+            // this lock, preventing mixed old-frame/new-window diagnostics.
+            stream_diagnostics_copy = input_interface_->GetStreamDiagnostics();
           } // Release lock after all observation-dependent operations
 
           // Log post-state data (token state) to the most recent state logger entry
@@ -3969,7 +3979,7 @@ class G1Deploy {
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
                 left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,
                 heading_state_buffer_, current_motion_copy, current_frame_copy,
-                input_interface_->GetStreamDiagnostics()
+                stream_diagnostics_copy
               );
             }
           }

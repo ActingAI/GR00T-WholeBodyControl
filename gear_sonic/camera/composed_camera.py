@@ -17,6 +17,8 @@ Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
 """
 
+from __future__ import annotations
+
 from collections import deque
 from dataclasses import dataclass
 import queue
@@ -388,7 +390,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
             from gear_sonic.camera.drivers.usb_camera import USBCameraConfig, USBCameraSensor
 
             usb_config = USBCameraConfig()
-            device_idx = int(device_id) if device_id else 0
+            device_idx: int | str = (
+                int(device_id) if device_id and device_id.isdigit() else device_id or 0
+            )
             print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
             return USBCameraSensor(
                 config=usb_config, mount_position=mount_position, device_index=device_idx
@@ -500,8 +504,15 @@ class ComposedCameraSensor(Sensor, SensorServer):
 class ComposedCameraClientSensor(Sensor, SensorClient):
     """ZMQ client that deserializes merged camera frames from the server."""
 
-    def __init__(self, server_ip: str = "localhost", port: int = 5555):
+    def __init__(
+        self,
+        server_ip: str = "localhost",
+        port: int = 5555,
+        *,
+        print_latency: bool = True,
+    ):
         self.start_client(server_ip, port)
+        self._print_latency = bool(print_latency)
 
         self._latest_message = None
         self._avg_time_per_frame: deque = deque(maxlen=20)
@@ -534,7 +545,7 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self._latest_message["message_index"] = self.idx
             self._last_new_message_time = current_time
 
-            if self.idx % 10 == 0:
+            if self._print_latency and self.idx % 10 == 0:
                 for image_key, image_time in self._latest_message["timestamps"].items():
                     image_latency = (time.time() - image_time) * 1000
                     print(f"Image latency for {image_key}: {image_latency:.2f} ms")

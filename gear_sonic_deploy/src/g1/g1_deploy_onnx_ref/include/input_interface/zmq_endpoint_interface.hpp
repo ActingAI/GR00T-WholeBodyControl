@@ -123,6 +123,7 @@ public:
     int stream_window_start_ = 0;
     int stream_window_end_ = -1;
     int stream_frame_step_ = 1;
+    uint64_t accepted_packet_sequence_ = 0;
 
     static constexpr std::string_view LOCALHOST = "localhost";
 
@@ -383,6 +384,9 @@ public:
             int frame_offset_adjustment = 0;
             bool did_catchup = false;
             int protocol_version_for_mode_update = -1;
+            int pending_window_start = 0;
+            int pending_window_end = -1;
+            int pending_frame_step = 1;
             {
                 std::lock_guard<std::mutex> lock(data_mutex_);
                 if (has_new_data_) {
@@ -443,17 +447,17 @@ public:
                         
                         new_motion = result.motion;
                         std::cout << "[ZMQEndpointInterface] motion name: " << new_motion->name << std::endl;
-                        stream_window_start_ = result.window_start;
-                        stream_frame_step_ = result.frame_step;
-                        stream_window_end_ = stream_window_start_ + result.frame_step * (new_motion->timesteps - 1);
+                        pending_window_start = result.window_start;
+                        pending_frame_step = result.frame_step;
+                        pending_window_end = pending_window_start + result.frame_step * (new_motion->timesteps - 1);
                         frame_offset_adjustment = result.frame_offset_adjustment;
                         did_catchup = result.did_catchup_reset;
                         
                         if constexpr (DEBUG_LOGGING) {
-                            int window_end_msg_idx = stream_window_start_ + result.frame_step * (new_motion->timesteps - 1);
+                            int window_end_msg_idx = pending_window_end;
                             std::cout << "[ZMQEndpointInterface] Merged streamed data: " 
                                       << new_motion->timesteps << " current-rate frames, "
-                                      << "window [" << stream_window_start_ << ".." << window_end_msg_idx << "] (message-index)"
+                                      << "window [" << pending_window_start << ".." << window_end_msg_idx << "] (message-index)"
                                       << ", frame_step=" << result.frame_step
                                       << ", frame_offset_adjustment=" << frame_offset_adjustment
                                       << ", did_catchup=" << did_catchup << std::endl;
@@ -476,6 +480,13 @@ public:
                     current_motion = streamed_motion_;  // Assign shared_ptr directly for thread safety
                     operator_state.play = true; // Auto-play when entering ZMQ mode
                     reinitialize_heading = true;
+                    {
+                        std::lock_guard<std::mutex> data_lock(data_mutex_);
+                        stream_window_start_ = pending_window_start;
+                        stream_window_end_ = pending_window_end;
+                        stream_frame_step_ = pending_frame_step;
+                        ++accepted_packet_sequence_;
+                    }
                     
                     if constexpr (DEBUG_LOGGING) {
                         std::cout << "[ZMQEndpointInterface] Catch-up: Reset to frame 0 at global frame " 
@@ -484,14 +495,15 @@ public:
                 } else {
                     // Normal case: Adjust current_frame to maintain global playback position after window shift
                     // current_frame represents "the next frame to be read" (not yet consumed)
+                    std::lock_guard<std::mutex> lock(current_motion_mutex);
                     int adjusted_frame = current_frame - frame_offset_adjustment;
                     
                     // Validate the adjustment doesn't cause discontinuities due to clamping
                     if (adjusted_frame < 0) {
                         if constexpr (DEBUG_LOGGING) {
                             std::cout << "[ZMQEndpointInterface] WARNING: Window shifted past playback position. "
-                                      << "Skipping from global frame " << (stream_window_start_ - frame_offset_adjustment + current_frame)
-                                      << " to " << stream_window_start_ << std::endl;
+                                      << "Skipping from global frame " << (pending_window_start - frame_offset_adjustment + current_frame)
+                                      << " to " << pending_window_start << std::endl;
                         }
                         adjusted_frame = 0; // Start from beginning of new window
                     } else if (adjusted_frame >= streamed_motion_->timesteps) {
@@ -503,10 +515,16 @@ public:
                         adjusted_frame = (streamed_motion_->timesteps > 0) ? (streamed_motion_->timesteps - 1) : 0;
                     }
                     
-                    std::lock_guard<std::mutex> lock(current_motion_mutex);
                     current_frame = adjusted_frame;
                     current_motion = streamed_motion_;  // Assign shared_ptr directly for thread safety
                     operator_state.play = true; // Auto-play when entering ZMQ mode
+                    {
+                        std::lock_guard<std::mutex> data_lock(data_mutex_);
+                        stream_window_start_ = pending_window_start;
+                        stream_window_end_ = pending_window_end;
+                        stream_frame_step_ = pending_frame_step;
+                        ++accepted_packet_sequence_;
+                    }
                 }
                 
             }
@@ -593,6 +611,7 @@ public:
       diagnostics.window_start = stream_window_start_;
       diagnostics.frame_step = stream_frame_step_;
       diagnostics.window_end = diagnostics.active ? stream_window_end_ : -1;
+      diagnostics.accepted_packet_sequence = accepted_packet_sequence_;
       return diagnostics;
     }
     
